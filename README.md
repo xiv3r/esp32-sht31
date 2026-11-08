@@ -1,6 +1,6 @@
 ## **Components required**
 - ESP32
-- SHT32
+- SHT31
 - DUPONT WIRE
 
 ## 1. Wire it up
@@ -23,7 +23,9 @@ No extra wiring for the BOOT button — GPIO0 is already on the board.
 1. Install **Arduino IDE** + **ESP32 board support** (Boards Manager → “esp32” by Espressif, v2.0.0 or newer).
 2. Open `ESP32_SHT31_Controller.ino`.
 3. Tools → Board → **ESP32 Dev Module**.
-4. Select the correct **COM port** and click **Upload**.
+4. Select the correct **COM port** and click **Upload**
+5. or directly download the firmware and flash.
+   - https://github.com/xiv3r/esp32-sht31/raw/refs/heads/main/esp32-sht31-0x0.bin
 
 ## 3. Connect
 1. On your phone or PC, join WiFi:

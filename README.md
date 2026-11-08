@@ -1,3 +1,5 @@
+<img src="https://github.com/xiv3r/esp32-sht31/blob/main/esp32-sht31.png">
+
 ## **Components required**
 - ESP32
 - SHT31

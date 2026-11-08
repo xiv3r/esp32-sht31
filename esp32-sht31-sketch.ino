@@ -1,5 +1,5 @@
 /*
- * ESP32_SHT31_Controller
+ * ESP32_SHT31_Controller.ino
  * ---------------------------------------------------------------
  * - WiFi AP always on: SSID "ESP32_SHT31", pass "12345678"
  * - Captive portal (DNS hijack + 302 redirect)
@@ -41,7 +41,7 @@ static const char* DEF_AP_SSID = "ESP32_SHT31";
 static const char* DEF_AP_PASS = "12345678";
 
 static const uint32_t CFG_MAGIC   = 0x53485433;
-static const uint16_t CFG_VERSION = 3;
+static const uint16_t CFG_VERSION = 4;
 static const char*    NVS_NS      = "sht31cfg";
 
 struct Config {
@@ -61,7 +61,7 @@ struct Config {
   uint32_t crc32;
 };
 
-static_assert(sizeof(Config) == 136, "Config ABI changed — bump CFG_VERSION");
+static_assert(sizeof(Config) == 132, "Config ABI changed — bump CFG_VERSION");
 
 static Config g_cfg;
 static Preferences g_prefs;
@@ -482,22 +482,22 @@ static void ap_ensure() {
 static void addCors() { g_server.sendHeader("Cache-Control", "no-store"); }
 
 static void handleRoot() {
-  static const PGM_P parts[] = { PAGE_HEAD, PAGE_NAV, PAGE_DASH, PAGE_FOOT };
+  static PGM_P const parts[] = { PAGE_HEAD, PAGE_NAV, PAGE_DASH, PAGE_FOOT };
   sendPage(parts, sizeof(parts) / sizeof(parts[0]));
 }
 
 static void handleRelayPage() {
-  static const PGM_P parts[] = { PAGE_HEAD, PAGE_NAV, PAGE_RELAY, PAGE_FOOT };
+  static PGM_P const parts[] = { PAGE_HEAD, PAGE_NAV, PAGE_RELAY, PAGE_FOOT };
   sendPage(parts, sizeof(parts) / sizeof(parts[0]));
 }
 
 static void handleWifiPage() {
-  static const PGM_P parts[] = { PAGE_HEAD, PAGE_NAV, PAGE_WIFI, PAGE_FOOT };
+  static PGM_P const parts[] = { PAGE_HEAD, PAGE_NAV, PAGE_WIFI, PAGE_FOOT };
   sendPage(parts, sizeof(parts) / sizeof(parts[0]));
 }
 
 static void handle404() {
-  static const PGM_P parts[] = { PAGE_HEAD, PAGE_NAV, PAGE_404, PAGE_FOOT };
+  static PGM_P const parts[] = { PAGE_HEAD, PAGE_NAV, PAGE_404, PAGE_FOOT };
   size_t total = 0;
   for (size_t i = 0; i < sizeof(parts) / sizeof(parts[0]); i++) total += strlen_P(parts[i]);
   g_server.sendHeader("Cache-Control", "no-store");

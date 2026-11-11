@@ -5,6 +5,8 @@
 #include <Adafruit_SHT31.h>
 #include <EEPROM.h>
 #include <stddef.h>
+#include <ctype.h>
+#include <math.h>
 
 #define SDA_PIN 5
 #define SCL_PIN 4
@@ -50,6 +52,7 @@ static uint32_t lastDnsProcess = 0;
 static uint32_t bootButtonPressStart = 0;
 static bool bootButtonHeld = false;
 static uint32_t eepromDirtyAt = 0;
+static uint32_t sensorInvalidSince = 0;
 
 static uint32_t crc32(const uint8_t *data, size_t len) {
   uint32_t crc = 0xFFFFFFFFu;
@@ -102,10 +105,10 @@ static void scheduleReset() {
   pendingResetAt = millis();
 }
 
-static void scheduleFactoryReset() {
+static void scheduleFactoryReset(bool fromButton) {
   pendingFactory = true;
   pendingReset = true;
-  pendingResetFromButton = false;
+  pendingResetFromButton = fromButton;
   pendingResetAt = millis();
 }
 
@@ -146,7 +149,14 @@ static void readSensor() {
 }
 
 static void updateRelay() {
-  if (!sensorValid) return;
+  if (!sensorValid) {
+    if (sensorInvalidSince == 0) sensorInvalidSince = millis();
+    else if ((uint32_t)(millis() - sensorInvalidSince) >= 60000UL) {
+      if (relayState) { relayState = false; digitalWrite(RELAY_PIN, LOW); }
+    }
+    return;
+  }
+  sensorInvalidSince = 0;
   int64_t hyst = cfg.hystMilli;
   int64_t tTh  = cfg.tempThresholdMilli;
   int64_t hTh  = cfg.humThresholdMilli;
@@ -166,8 +176,7 @@ static void checkBootButton() {
   if (digitalRead(BUTTON_PIN) == LOW) {
     if (!bootButtonHeld) { bootButtonHeld = true; bootButtonPressStart = now; }
     else if ((uint32_t)(now - bootButtonPressStart) >= 5000UL && !pendingFactory) {
-      scheduleFactoryReset();
-      pendingResetFromButton = true;
+      scheduleFactoryReset(true);
     }
   } else bootButtonHeld = false;
 }
@@ -185,6 +194,7 @@ static void flushEeprom() {
   if ((uint32_t)(now - eepromDirtyAt) < 2000UL) return;
   eepromDirtyAt = now;
   saveConfig();
+  if (eepromDirty) eepromDirtyAt = millis();
 }
 
 static void handlePendingReset() {
@@ -317,7 +327,9 @@ static void handleSet() {
   bool ok = parseDoubleStrict(server.arg("t"), t)
          && parseDoubleStrict(server.arg("h"), h)
          && parseDoubleStrict(server.arg("y"), y);
+  bool applied = false;
   if (ok && t>=-50.0 && t<=150.0 && h>=0.0 && h<=100.0 && y>=0.0 && y<=50.0) {
+    applied = true;
     int64_t nt = (int64_t)llround(t * 1000.0);
     int64_t nh = (int64_t)llround(h * 1000.0);
     int64_t ny = (int64_t)llround(y * 1000.0);
@@ -329,13 +341,13 @@ static void handleSet() {
       eepromDirtyAt = millis();
     }
   }
-  server.sendHeader("Location", "/");
+  server.sendHeader("Location", applied ? "/" : "/?err=1");
   server.send(302, "text/plain", "");
 }
 
 static void handleFactory() {
   server.send(200, "text/plain", "OK");
-  scheduleFactoryReset();
+  scheduleFactoryReset(false);
 }
 
 static void handleRestart() {

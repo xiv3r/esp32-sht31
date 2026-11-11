@@ -165,8 +165,7 @@ static void checkBootButton() {
   uint32_t now = millis();
   if (digitalRead(BUTTON_PIN) == LOW) {
     if (!bootButtonHeld) { bootButtonHeld = true; bootButtonPressStart = now; }
-    else if ((uint32_t)(now - bootButtonPressStart) >= 5000UL) {
-      bootButtonHeld = false;
+    else if ((uint32_t)(now - bootButtonPressStart) >= 5000UL && !pendingFactory) {
       scheduleFactoryReset();
       pendingResetFromButton = true;
     }

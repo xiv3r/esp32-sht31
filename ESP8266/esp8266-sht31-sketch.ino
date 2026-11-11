@@ -4,6 +4,7 @@
 #include <Wire.h>
 #include <Adafruit_SHT31.h>
 #include <EEPROM.h>
+#include <stddef.h>
 
 #define SDA_PIN 5
 #define SCL_PIN 4
@@ -26,7 +27,7 @@ struct Config {
   int64_t humThresholdMilli;
   int64_t hystMilli;
   uint32_t crc;
-};
+} __attribute__((packed));
 
 static Config cfg;
 static Adafruit_SHT31 sht31;
@@ -39,6 +40,7 @@ static bool sensorValid = false;
 static bool eepromDirty = false;
 static bool pendingReset = false;
 static bool pendingFactory = false;
+static bool pendingResetFromButton = false;
 static uint32_t pendingResetAt = 0;
 
 static int64_t lastTempMilli = 0;
@@ -61,7 +63,7 @@ static uint32_t crc32(const uint8_t *data, size_t len) {
 
 static void saveConfig() {
   cfg.magic = EEPROM_MAGIC;
-  cfg.crc = crc32((uint8_t*)&cfg, sizeof(Config) - sizeof(uint32_t));
+  cfg.crc = crc32((uint8_t*)&cfg, offsetof(Config, crc));
   EEPROM.put(0, cfg);
   if (EEPROM.commit()) { eepromDirty = false; }
 }
@@ -75,24 +77,35 @@ static void applyDefaults() {
 static void loadConfig() {
   EEPROM.get(0, cfg);
   if (cfg.magic != EEPROM_MAGIC) { applyDefaults(); saveConfig(); return; }
-  uint32_t expected = crc32((uint8_t*)&cfg, sizeof(Config) - sizeof(uint32_t));
+  uint32_t expected = crc32((uint8_t*)&cfg, offsetof(Config, crc));
   if (cfg.crc != expected) { applyDefaults(); saveConfig(); return; }
-  if (cfg.tempThresholdMilli < -50000) cfg.tempThresholdMilli = -50000;
-  if (cfg.tempThresholdMilli > 150000) cfg.tempThresholdMilli = 150000;
-  if (cfg.humThresholdMilli  < 0)      cfg.humThresholdMilli  = 0;
-  if (cfg.humThresholdMilli  > 100000) cfg.humThresholdMilli  = 100000;
-  if (cfg.hystMilli < 0)               cfg.hystMilli          = 0;
-  if (cfg.hystMilli > 50000)           cfg.hystMilli          = 50000;
+  int64_t ct = cfg.tempThresholdMilli;
+  int64_t ch = cfg.humThresholdMilli;
+  int64_t cy = cfg.hystMilli;
+  if (ct < -50000) ct = -50000;
+  if (ct > 150000) ct = 150000;
+  if (ch < 0)      ch = 0;
+  if (ch > 100000) ch = 100000;
+  if (cy < 0)      cy = 0;
+  if (cy > 50000)  cy = 50000;
+  if (ct != cfg.tempThresholdMilli || ch != cfg.humThresholdMilli || cy != cfg.hystMilli) {
+    cfg.tempThresholdMilli = ct;
+    cfg.humThresholdMilli  = ch;
+    cfg.hystMilli          = cy;
+    saveConfig();
+  }
 }
 
 static void scheduleReset() {
   pendingReset = true;
+  pendingResetFromButton = false;
   pendingResetAt = millis();
 }
 
 static void scheduleFactoryReset() {
   pendingFactory = true;
   pendingReset = true;
+  pendingResetFromButton = false;
   pendingResetAt = millis();
 }
 
@@ -155,6 +168,7 @@ static void checkBootButton() {
     else if ((uint32_t)(now - bootButtonPressStart) >= 5000UL) {
       bootButtonHeld = false;
       scheduleFactoryReset();
+      pendingResetFromButton = true;
     }
   } else bootButtonHeld = false;
 }
@@ -170,19 +184,28 @@ static void flushEeprom() {
   if (!eepromDirty) return;
   uint32_t now = millis();
   if ((uint32_t)(now - eepromDirtyAt) < 2000UL) return;
+  eepromDirtyAt = now;
   saveConfig();
 }
 
 static void handlePendingReset() {
   if (!pendingReset) return;
   if ((uint32_t)(millis() - pendingResetAt) < 200UL) return;
+  if (pendingResetFromButton) {
+    if (digitalRead(BUTTON_PIN) == LOW) {
+      if ((uint32_t)(millis() - pendingResetAt) < 10000UL) return;
+    }
+  }
   pendingReset = false;
+  pendingResetFromButton = false;
   if (pendingFactory) {
     pendingFactory = false;
     cfg.magic = 0;
     cfg.crc = 0;
     EEPROM.put(0, cfg);
     EEPROM.commit();
+  } else if (eepromDirty) {
+    saveConfig();
   }
   ESP.restart();
 }
@@ -232,7 +255,7 @@ static void handleRoot() {
   server.sendContent_P(P_HEAD);
 
   {
-    char buf[96];
+    char buf[128];
     {
       int64_t v = cfg.tempThresholdMilli;
       bool neg = v < 0;
@@ -296,9 +319,9 @@ static void handleSet() {
          && parseDoubleStrict(server.arg("h"), h)
          && parseDoubleStrict(server.arg("y"), y);
   if (ok && t>=-50.0 && t<=150.0 && h>=0.0 && h<=100.0 && y>=0.0 && y<=50.0) {
-    int64_t nt = (int64_t)(t*1000.0);
-    int64_t nh = (int64_t)(h*1000.0);
-    int64_t ny = (int64_t)(y*1000.0);
+    int64_t nt = (int64_t)llround(t * 1000.0);
+    int64_t nh = (int64_t)llround(h * 1000.0);
+    int64_t ny = (int64_t)llround(y * 1000.0);
     if (nt != cfg.tempThresholdMilli || nh != cfg.humThresholdMilli || ny != cfg.hystMilli) {
       cfg.tempThresholdMilli = nt;
       cfg.humThresholdMilli  = nh;
@@ -382,4 +405,3 @@ void loop() {
   handlePendingReset();
   yield();
 }
-

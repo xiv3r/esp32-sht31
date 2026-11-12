@@ -1,21 +1,5 @@
 /*
- * ESP32_SHT31_Controller.ino
- * ---------------------------------------------------------------
- * - WiFi AP always on: SSID "ESP32_SHT31", pass "12345678"
- * - Captive portal (DNS hijack + 302 redirect)
- * - SHT31 temp/humidity dashboard
- * - Relay on GPIO25 (active-high/active-low selectable)
- * - Threshold triggers from temp OR humidity
- * - PROGMEM web UI (HTML/CSS/JS gzipped-free, chunked)
- * - WiFi AP management page (SSID/pass change, always reverts to AP)
- * - Relay management page
- * - GPIO0 5s hold -> factory reset
- * - NVS wear mitigation (only write on change, CRC, debounce)
- * - millis/micros overflow-safe (delta arithmetic everywhere)
- * - Heap-fragmentation friendly (String reserved, no per-request news)
- * - Fully non-blocking (no delay() in loop; deferred tasks)
- * - Config corruption protection (magic + version + CRC32 + double-buffer)
- * ---------------------------------------------------------------
+ * ESP32 SHT31 Temperature Humidity Sensor
  */
 
 #include <WiFi.h>
@@ -27,6 +11,7 @@
 #include <esp_system.h>
 
 static const uint8_t RELAY_PIN = 25;
+static const uint8_t ALARM_PIN = 26;
 static const uint8_t BOOT_BTN_PIN = 0;
 static const uint8_t SHT31_ADDR = 0x44;
 
@@ -78,6 +63,10 @@ static uint32_t   g_lastSensorRead = 0;
 static uint32_t   g_lastApCheck = 0;
 static uint32_t   g_lastDns = 0;
 static bool       g_relayState = false;
+
+static bool       g_alarmState = false;
+static bool       g_alarmActiveHigh = true;
+static uint8_t    g_alarmManual = 0;
 
 static uint8_t    sht_phase = 0;
 static uint32_t   sht_convStart = 0;
@@ -179,6 +168,23 @@ static bool cfg_saveIfChanged(Config& c) {
   return w == sizeof(Config);
 }
 
+static void alarm_loadNVS() {
+  g_prefs.begin(NVS_NS, true);
+  g_alarmActiveHigh = g_prefs.getUChar("alarmPol", 1) ? 1 : 0;
+  g_alarmManual     = g_prefs.getUChar("alarmMan", 0);
+  if (g_alarmManual > 2) g_alarmManual = 0;
+  g_prefs.end();
+}
+
+static bool alarm_saveNVS() {
+  g_prefs.begin(NVS_NS, false);
+  bool ok = true;
+  if (g_prefs.putUChar("alarmPol", g_alarmActiveHigh ? 1 : 0) != 1) ok = false;
+  if (g_prefs.putUChar("alarmMan", g_alarmManual) != 1) ok = false;
+  g_prefs.end();
+  return ok;
+}
+
 static const char PAGE_HEAD[] PROGMEM = R"HTML(<!DOCTYPE html><html><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 <title>ESP32 SHT31</title><style>
@@ -211,7 +217,7 @@ footer{text-align:center;padding:16px;font-size:12px;opacity:.5}
 </style></head><body>)HTML";
 
 static const char PAGE_NAV[] PROGMEM = R"HTML(<header><h1>ESP32 SHT31</h1><nav>
-<a href="/">Dashboard</a><a href="/relay">Relay</a><a href="/wifi">WiFi</a>
+<a href="/">Dashboard</a><a href="/relay">Relay</a><a href="/alarm">Alarm</a><a href="/wifi">WiFi</a>
 </nav></header><main>)HTML";
 
 static const char PAGE_FOOT[] PROGMEM = R"HTML(</main><footer>ESP32 &middot; SHT31 &middot; PROGMEM UI</footer>
@@ -230,6 +236,7 @@ static const char PAGE_DASH[] PROGMEM = R"HTML(<div class="card">
 <div class="row" style="margin-top:12px">
 <span>Sensor:</span><span id="sok" class="badge off">unknown</span>
 <span style="margin-left:auto">Relay:</span><span id="rs" class="badge off">off</span>
+<span style="margin-left:12px">Alarm:</span><span id="as" class="badge off">off</span>
 </div>
 </div>
 <div class="card">
@@ -259,6 +266,8 @@ function refresh(){
   s.className='badge '+(d.sensorOk?'on':'off');
   var r=document.getElementById('rs'); r.textContent=d.relay?'ON':'OFF';
   r.className='badge '+(d.relay?'on':'off');
+  var a=document.getElementById('as'); a.textContent=d.alarm?'ON':'OFF';
+  a.className='badge '+(d.alarm?'on':'off');
   if(!document.activeElement || document.activeElement.tagName!=='INPUT'){
    set('tm',d.trigMode); set('tt',d.tempThr); set('ht',d.humThr);
    set('th',d.tempHyst); set('hh',d.humHyst);
@@ -302,6 +311,38 @@ function refresh(){
 }
 function savePol(){post('/api/relay',(document.getElementById('pol').value==1?'pol=1':'pol=0')).then(d=>toast(d.ok?'Saved':'Failed: '+(d.err||'unknown'))).catch(()=>toast('Network error'))}
 function saveMode(){post('/api/relay','mode='+document.getElementById('mode').value).then(d=>toast(d.ok?'Saved':'Failed: '+(d.err||'unknown'))).catch(()=>toast('Network error'))}
+refresh(); setInterval(refresh,2500);
+</script>)HTML";
+
+static const char PAGE_ALARM[] PROGMEM = R"HTML(<div class="card">
+<h2>Alarm (GPIO26)</h2>
+<div class="row"><span>State:</span><span id="as" class="badge off">--</span></div>
+<label>Wiring polarity</label>
+<select id="pol" onchange="savePol()">
+<option value="1">Active HIGH</option><option value="0">Active LOW</option>
+</select>
+<label>Mode</label>
+<select id="mode" onchange="saveMode()">
+<option value="0">Auto (mirror relay + fault)</option>
+<option value="1">Force ON</option>
+<option value="2">Force OFF</option>
+</select>
+<div class="row" style="margin-top:12px">
+<button class="alt" onclick="saveMode()">Apply Mode</button>
+</div>
+<p style="font-size:12px;opacity:.6;margin-top:12px">Auto mode: alarm ON when relay output is ON, or when the sensor has been in fault for 30 s or more.</p>
+</div>
+<script>
+function refresh(){
+ fetch('/api/status').then(r=>r.json()).then(d=>{
+  var s=document.getElementById('as'); s.textContent=d.alarm?'ON':'OFF';
+  s.className='badge '+(d.alarm?'on':'off');
+  document.getElementById('pol').value=d.alarmActiveHigh?1:0;
+  document.getElementById('mode').value=d.alarmManual;
+ }).catch(()=>{});
+}
+function savePol(){post('/api/alarm',(document.getElementById('pol').value==1?'pol=1':'pol=0')).then(d=>toast(d.ok?'Saved':'Failed: '+(d.err||'unknown'))).catch(()=>toast('Network error'))}
+function saveMode(){post('/api/alarm','mode='+document.getElementById('mode').value).then(d=>toast(d.ok?'Saved':'Failed: '+(d.err||'unknown'))).catch(()=>toast('Network error'))}
 refresh(); setInterval(refresh,2500);
 </script>)HTML";
 
@@ -414,6 +455,26 @@ static void relay_apply(bool physicalOn) {
   digitalWrite(RELAY_PIN, level ? HIGH : LOW);
 }
 
+static void alarm_apply(bool physicalOn) {
+  g_alarmState = physicalOn;
+  bool level = g_alarmActiveHigh ? physicalOn : !physicalOn;
+  digitalWrite(ALARM_PIN, level ? HIGH : LOW);
+}
+
+static void alarm_update() {
+  bool physical;
+  if (g_alarmManual == 1) {
+    physical = true;
+  } else if (g_alarmManual == 2) {
+    physical = false;
+  } else {
+    bool faultAlarm = (!g_sensorOk && g_sensorFaultSince != 0 &&
+                       (uint32_t)(millis() - g_sensorFaultSince) >= SENSOR_FAULT_TIMEOUT_MS);
+    physical = g_relayState || faultAlarm;
+  }
+  alarm_apply(physical);
+}
+
 static bool thresholdEval() {
   if (!g_sensorOk) return g_relayAutoState;
 
@@ -523,6 +584,11 @@ static void handleRelayPage() {
   sendPage(parts, sizeof(parts) / sizeof(parts[0]));
 }
 
+static void handleAlarmPage() {
+  static PGM_P const parts[] = { PAGE_HEAD, PAGE_NAV, PAGE_ALARM, PAGE_FOOT };
+  sendPage(parts, sizeof(parts) / sizeof(parts[0]));
+}
+
 static void handleWifiPage() {
   static PGM_P const parts[] = { PAGE_HEAD, PAGE_NAV, PAGE_WIFI, PAGE_FOOT };
   sendPage(parts, sizeof(parts) / sizeof(parts[0]));
@@ -540,19 +606,22 @@ static void handle404() {
 }
 
 static void handleStatus() {
-  char buf[512];
+  char buf[640];
   (void)snprintf(buf, sizeof(buf),
-    "{\"temp\":%.2f,\"hum\":%.2f,\"sensorOk\":%s,\"relay\":%s,"
+    "{\"temp\":%.2f,\"hum\":%.2f,\"sensorOk\":%s,\"relay\":%s,\"alarm\":%s,"
     "\"trigMode\":%u,\"tempThr\":%.2f,\"humThr\":%.2f,"
     "\"tempHyst\":%.2f,\"humHyst\":%.2f,"
     "\"relayActiveHigh\":%u,\"relayManual\":%u,"
+    "\"alarmActiveHigh\":%u,\"alarmManual\":%u,"
     "\"ap\":%s,\"ssid\":\"%s\"}",
     isnan(g_tempC) ? 0.0f : g_tempC, isnan(g_humPct) ? 0.0f : g_humPct,
     g_sensorOk ? "true" : "false",
     g_relayState ? "true" : "false",
+    g_alarmState ? "true" : "false",
     g_cfg.trigMode, g_cfg.tempThreshold, g_cfg.humThreshold,
     g_cfg.tempHyst, g_cfg.humHyst,
     g_cfg.relayActiveHigh, g_cfg.relayManual,
+    g_alarmActiveHigh ? 1 : 0, g_alarmManual,
     g_apRunning ? "true" : "false", g_cfg.apSsid);
   addCors();
   g_server.send(200, "application/json", buf);
@@ -597,6 +666,7 @@ static void handleThresholds() {
   bool saved = cfg_saveIfChanged(c);
   if (saved) g_cfg = c;
   relay_update();
+  alarm_update();
   g_server.send(saved ? 200 : 500, "application/json",
                 saved ? "{\"ok\":true}" : "{\"ok\":false,\"err\":\"nvs\"}");
 }
@@ -609,6 +679,23 @@ static void handleRelayApi() {
   bool saved = cfg_saveIfChanged(c);
   if (saved) g_cfg = c;
   relay_update();
+  alarm_update();
+  g_server.send(saved ? 200 : 500, "application/json",
+                saved ? "{\"ok\":true}" : "{\"ok\":false,\"err\":\"nvs\"}");
+}
+
+static void handleAlarmApi() {
+  bool pol = g_alarmActiveHigh;
+  uint8_t man = g_alarmManual;
+  if (g_server.hasArg("pol")) pol = g_server.arg("pol").toInt() ? true : false;
+  if (g_server.hasArg("mode")) man = (uint8_t)constrain(g_server.arg("mode").toInt(), 0, 2);
+  g_alarmActiveHigh = pol;
+  g_alarmManual = man;
+  bool saved = alarm_saveNVS();
+  if (!saved) {
+    alarm_loadNVS();
+  }
+  alarm_update();
   g_server.send(saved ? 200 : 500, "application/json",
                 saved ? "{\"ok\":true}" : "{\"ok\":false,\"err\":\"nvs\"}");
 }
@@ -667,7 +754,10 @@ static void handleFactory() {
   g_server.send(ok ? 200 : 500, "application/json",
                 ok ? "{\"ok\":true}" : "{\"ok\":false,\"err\":\"nvs\"}");
   g_server.client().flush();
-  if (ok) g_rebootAt = millis() + 400;
+  if (ok) {
+    alarm_apply(false);
+    g_rebootAt = millis() + 400;
+  }
 }
 
 static void handleCaptive() {
@@ -679,6 +769,8 @@ void setup() {
   Serial.begin(115200);
   pinMode(RELAY_PIN, OUTPUT);
   digitalWrite(RELAY_PIN, LOW);
+  pinMode(ALARM_PIN, OUTPUT);
+  digitalWrite(ALARM_PIN, LOW);
   pinMode(BOOT_BTN_PIN, INPUT_PULLUP);
 
   Wire.begin();
@@ -691,15 +783,20 @@ void setup() {
     g_prefs.end();
   }
 
+  alarm_loadNVS();
+
   relay_apply(false);
+  alarm_apply(false);
   if (ap_start()) g_dnsIp = WiFi.softAPIP();
 
   g_server.on("/", HTTP_GET, handleRoot);
   g_server.on("/relay", HTTP_GET, handleRelayPage);
+  g_server.on("/alarm", HTTP_GET, handleAlarmPage);
   g_server.on("/wifi", HTTP_GET, handleWifiPage);
   g_server.on("/api/status", HTTP_GET, handleStatus);
   g_server.on("/api/thresholds", HTTP_POST, handleThresholds);
   g_server.on("/api/relay", HTTP_POST, handleRelayApi);
+  g_server.on("/api/alarm", HTTP_POST, handleAlarmApi);
   g_server.on("/api/wifi", HTTP_POST, handleWifiApi);
   g_server.on("/api/factory", HTTP_POST, handleFactory);
   g_server.onNotFound([]() {
@@ -736,6 +833,7 @@ void loop() {
       if (g_sensorOk || g_sensorFaultSince == 0) g_sensorFaultSince = now;
       g_sensorOk = false;
       relay_update();
+      alarm_update();
     }
   }
 
@@ -747,10 +845,12 @@ void loop() {
       g_sensorOk = true;
       g_sensorFaultSince = 0;
       relay_update();
+      alarm_update();
     } else if (r < 0) {
       if (g_sensorOk || g_sensorFaultSince == 0) g_sensorFaultSince = now;
       g_sensorOk = false;
       relay_update();
+      alarm_update();
     }
   }
 
@@ -760,6 +860,7 @@ void loop() {
     if (g_apRunning) g_dnsIp = WiFi.softAPIP();
     else g_dnsIp = IPAddress(0, 0, 0, 0);
     g_apIpZeroCount = 0;
+    alarm_update();
   }
 
   if ((uint32_t)(now - g_lastApCheck) >= AP_CHECK_INTERVAL_MS) {
@@ -780,9 +881,8 @@ void loop() {
       if (ok) ok = g_prefs.clear();
       g_prefs.end();
       if (ok) {
+        alarm_apply(false);
         ESP.restart();
-      } else {
-        Serial.println("Factory reset failed: NVS clear error");
       }
     }
   }

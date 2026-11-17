@@ -1,903 +1,1570 @@
-/*
- * ESP32 SHT31 Temperature Humidity Sensor
- */
-
+#include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <DNSServer.h>
-#include <Wire.h>
 #include <Preferences.h>
-#include <esp_task_wdt.h>
-#include <esp_system.h>
+#include <Wire.h>
+#include <esp_timer.h>
+#include <stddef.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <math.h>
 
-static const uint8_t RELAY_PIN = 25;
-static const uint8_t ALARM_PIN = 26;
-static const uint8_t BOOT_BTN_PIN = 0;
-static const uint8_t SHT31_ADDR = 0x44;
+static const uint8_t PIN_SDA = 21;
+static const uint8_t PIN_SCL = 22;
+static const uint8_t PIN_RELAY = 25;
+static const uint8_t PIN_BOOT = 0;
 
-static const uint32_t SENSOR_INTERVAL_MS   = 2000;
-static const uint32_t AP_CHECK_INTERVAL_MS = 3000;
-static const uint32_t BTN_DEBOUNCE_MS      = 30;
-static const uint32_t FACTORY_HOLD_MS      = 5000;
-static const uint32_t DNS_INTERVAL_MS      = 50;
-static const uint32_t SHT_CONV_WAIT_MS     = 20;
-static const uint32_t SENSOR_FAULT_TIMEOUT_MS = 30000;
+static const uint8_t SHT31_ADDR_A = 0x44;
+static const uint8_t SHT31_ADDR_B = 0x45;
 
-static const char* DEF_AP_SSID = "ESP32_SHT31";
-static const char* DEF_AP_PASS = "12345678";
+static const uint32_t CONFIG_MAGIC = 0x53485433UL;
+static const uint16_t CONFIG_VERSION = 1;
+static const char CONFIG_NS[] = "cfg";
+static const char DEFAULT_SSID[] = "ESP32_SHT31";
+static const char DEFAULT_PASS[] = "12345678";
 
-static const uint32_t CFG_MAGIC   = 0x53485433;
-static const uint16_t CFG_VERSION = 4;
-static const char*    NVS_NS      = "sht31cfg";
+static const uint8_t MAX_AP_CLIENTS = 4;
+static const uint64_t FACTORY_HOLD_US = 5000000ULL;
+static const uint64_t SHT31_MEASUREMENT_WAIT_US = 16000ULL;
+static const uint64_t SENSOR_RETRY_US = 5000000ULL;
+static const uint64_t WIFI_APPLY_DELAY_US = 1500000ULL;
+static const uint64_t RESTART_DELAY_US = 750000ULL;
+static const uint64_t FACTORY_RESET_DELAY_US = 1000000ULL;
 
 struct Config {
   uint32_t magic;
   uint16_t version;
-  uint16_t _pad;
-  char     apSsid[33];
-  char     apPass[65];
-  uint8_t  relayActiveHigh;
-  uint8_t  relayManual;
-  uint8_t  trigMode;
-  uint8_t  _pad2;
-  float    tempThreshold;
-  float    humThreshold;
-  float    tempHyst;
-  float    humHyst;
+  uint16_t size;
+  uint64_t seq;
+  int64_t tempOffsetCenti;
+  int64_t humOffsetCenti;
+  int64_t relayThresholdCenti;
+  int64_t relayHysteresisCenti;
+  uint64_t relayMinSwitchMs;
+  uint64_t sampleIntervalMs;
+  char ssid[33];
+  char password[65];
+  uint8_t channel;
+  uint8_t hidden;
+  uint8_t relayEnabled;
+  uint8_t relaySource;
+  uint8_t relayComparator;
+  uint8_t relayActiveLow;
+  uint8_t relayManual;
+  uint8_t relayFailSafe;
+  uint8_t reserved[2];
   uint32_t crc32;
 };
 
-static_assert(sizeof(Config) == 132, "Config ABI changed — bump CFG_VERSION");
+static Config gConfig;
+static uint8_t gActiveSlot = 0;
+static uint64_t gConfigSeq = 0;
 
-static Config g_cfg;
-static Preferences g_prefs;
+static WebServer server(80);
+static DNSServer dnsServer;
 
-static WebServer  g_server(80);
-static DNSServer  g_dns;
-static bool       g_apRunning = false;
+static int64_t tempCenti = 0;
+static int64_t humCenti = 0;
+static uint8_t sensorAddr = SHT31_ADDR_A;
+static bool sensorOk = false;
+static uint8_t sensorFailCount = 0;
+static uint64_t sensorErrorCount = 0;
+static uint64_t sensorReadCount = 0;
+static uint64_t lastSensorReadUs = 0;
+static uint64_t lastValidSensorUs = 0;
+static uint64_t nextSensorTriggerUs = 0;
+static uint64_t sensorMeasureStartUs = 0;
 
-static float      g_tempC = NAN;
-static float      g_humPct = NAN;
-static bool       g_sensorOk = false;
-static uint32_t   g_lastSensorRead = 0;
-static uint32_t   g_lastApCheck = 0;
-static uint32_t   g_lastDns = 0;
-static bool       g_relayState = false;
+enum SensorState {
+  SENSOR_IDLE = 0,
+  SENSOR_WAIT = 1
+};
 
-static bool       g_alarmState = false;
-static bool       g_alarmActiveHigh = true;
-static uint8_t    g_alarmManual = 0;
+static SensorState sensorState = SENSOR_IDLE;
 
-static uint8_t    sht_phase = 0;
-static uint32_t   sht_convStart = 0;
+static bool relayOn = false;
+static uint8_t relayPhysical = 255;
+static uint64_t lastRelaySwitchUs = 0;
 
-static uint32_t   g_rebootAt = 0;
+static bool bootButtonPressed = false;
+static bool bootResetTriggered = false;
+static uint64_t bootButtonStartUs = 0;
 
-static uint32_t   g_sensorFaultSince = 0;
-static uint32_t   g_apRestartAt = 0;
-static IPAddress  g_dnsIp(0, 0, 0, 0);
-static uint8_t    g_apIpZeroCount = 0;
+static bool wifiApplyPending = false;
+static bool restartPending = false;
+static bool factoryResetPending = false;
+static uint64_t wifiApplyAtUs = 0;
+static uint64_t restartAtUs = 0;
+static uint64_t factoryResetAtUs = 0;
 
-static bool       g_btnLastRaw = true;
-static bool       g_btnStable   = true;
-static uint32_t   g_btnLastChange = 0;
-static uint32_t   g_btnPressStart = 0;
-static bool       g_btnHoldHandled = false;
+static inline uint64_t nowUs() {
+  int64_t v = esp_timer_get_time();
+  return v > 0 ? (uint64_t)v : 0ULL;
+}
 
-static uint32_t crc32_update(uint32_t crc, const uint8_t* data, size_t len) {
-  crc = ~crc;
-  for (size_t i = 0; i < len; i++) {
+static size_t boundedStrLen(const char* s, size_t maxLen) {
+  size_t n = 0;
+  while (n < maxLen && s[n] != 0) {
+    ++n;
+  }
+  return n;
+}
+
+static void copyStr(char* dst, size_t dstSize, const char* src) {
+  if (!dst || dstSize == 0) {
+    return;
+  }
+  size_t i = 0;
+  while (i + 1 < dstSize && src[i] != 0) {
+    dst[i] = src[i];
+    ++i;
+  }
+  dst[i] = 0;
+}
+
+template <typename T>
+static T clampValue(T v, T lo, T hi) {
+  return v < lo ? lo : (v > hi ? hi : v);
+}
+
+static uint32_t crc32Calc(const uint8_t* data, size_t len) {
+  uint32_t crc = 0xFFFFFFFFUL;
+  for (size_t i = 0; i < len; ++i) {
     crc ^= data[i];
-    for (int k = 0; k < 8; k++) crc = (crc >> 1) ^ (0xEDB88320u & (-(int32_t)(crc & 1)));
+    for (uint8_t j = 0; j < 8; ++j) {
+      uint32_t mask = (uint32_t)-(int32_t)(crc & 1UL);
+      crc = (crc >> 1) ^ (0xEDB88320UL & mask);
+    }
   }
   return ~crc;
 }
 
-static bool cfg_validate(const Config& c) {
-  if (c.magic != CFG_MAGIC) return false;
-  if (c.version != CFG_VERSION) return false;
-  if (c.apPass[0] == '\0') return false;
-  size_t plen = strlen(c.apPass);
-  if (plen < 8 || plen > 63) return false;
-  if (c.apSsid[0] == '\0') return false;
-  if (strlen(c.apSsid) > 32) return false;
-  for (size_t i = 0; c.apSsid[i]; i++) {
-    char ch = c.apSsid[i];
-    if (ch < 0x20 || ch > 0x7E || ch == '"' || ch == '\\') return false;
-  }
-  if (c.trigMode > 3) return false;
-  if (c.relayManual > 2) return false;
-  return true;
-}
-
-static void cfg_defaults(Config& c) {
-  memset(&c, 0, sizeof(c));
-  c.magic = CFG_MAGIC;
-  c.version = CFG_VERSION;
-  strncpy(c.apSsid, DEF_AP_SSID, sizeof(c.apSsid) - 1);
-  strncpy(c.apPass, DEF_AP_PASS, sizeof(c.apPass) - 1);
-  c.relayActiveHigh = 1;
-  c.relayManual     = 0;
-  c.trigMode        = 2;
-  c.tempThreshold   = 30.0f;
-  c.humThreshold    = 60.0f;
-  c.tempHyst        = 0.5f;
-  c.humHyst         = 1.0f;
-}
-
-static void cfg_finalize(Config& c) {
-  c.crc32 = 0;
-  c.crc32 = crc32_update(0, (const uint8_t*)&c, sizeof(Config) - sizeof(uint32_t));
-}
-
-static bool cfg_loadFromNVS() {
-  g_prefs.begin(NVS_NS, true);
-  size_t n = g_prefs.getBytesLength("cfg");
-  bool ok = false;
-  if (n == sizeof(Config)) {
-    Config tmp;
-    if (g_prefs.getBytes("cfg", &tmp, sizeof(tmp)) == sizeof(tmp)) {
-      if (cfg_validate(tmp)) {
-        Config tmp2 = tmp;
-        uint32_t savedCrc = tmp2.crc32;
-        cfg_finalize(tmp2);
-        if (tmp2.crc32 == savedCrc) { g_cfg = tmp; ok = true; }
+static uint8_t sht31Crc(const uint8_t* data, size_t len) {
+  uint8_t crc = 0xFF;
+  for (size_t i = 0; i < len; ++i) {
+    crc ^= data[i];
+    for (uint8_t j = 0; j < 8; ++j) {
+      if (crc & 0x80) {
+        crc = (uint8_t)((crc << 1) ^ 0x31);
+      } else {
+        crc = (uint8_t)(crc << 1);
       }
     }
-  }
-  g_prefs.end();
-  return ok;
-}
-
-static bool cfg_saveIfChanged(Config& c) {
-  cfg_finalize(c);
-  Config existing;
-  bool have = false;
-  g_prefs.begin(NVS_NS, true);
-  if (g_prefs.getBytesLength("cfg") == sizeof(Config)) {
-    if (g_prefs.getBytes("cfg", &existing, sizeof(existing)) == sizeof(existing)) {
-      Config e2 = existing; cfg_finalize(e2);
-      have = (e2.crc32 == existing.crc32);
-    }
-  }
-  g_prefs.end();
-  if (have && memcmp(&existing, &c, sizeof(Config)) == 0) return true;
-  g_prefs.begin(NVS_NS, false);
-  size_t w = g_prefs.putBytes("cfg", &c, sizeof(Config));
-  g_prefs.end();
-  return w == sizeof(Config);
-}
-
-static void alarm_loadNVS() {
-  g_prefs.begin(NVS_NS, true);
-  g_alarmActiveHigh = g_prefs.getUChar("alarmPol", 1) ? 1 : 0;
-  g_alarmManual     = g_prefs.getUChar("alarmMan", 0);
-  if (g_alarmManual > 2) g_alarmManual = 0;
-  g_prefs.end();
-}
-
-static bool alarm_saveNVS() {
-  g_prefs.begin(NVS_NS, false);
-  bool ok = true;
-  if (g_prefs.putUChar("alarmPol", g_alarmActiveHigh ? 1 : 0) != 1) ok = false;
-  if (g_prefs.putUChar("alarmMan", g_alarmManual) != 1) ok = false;
-  g_prefs.end();
-  return ok;
-}
-
-static const char PAGE_HEAD[] PROGMEM = R"HTML(<!DOCTYPE html><html><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
-<title>ESP32 SHT31</title><style>
-:root{--bg:#0f172a;--card:#1e293b;--fg:#e2e8f0;--accent:#38bdf8;--ok:#22c55e;--warn:#f59e0b;--err:#ef4444}
-*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--fg)}
-header{display:flex;align-items:center;justify-content:space-between;padding:12px 16px;background:#111827;position:sticky;top:0;z-index:10}
-header h1{font-size:16px;margin:0}
-nav a{color:var(--fg);text-decoration:none;margin-left:14px;font-size:14px;opacity:.85}
-nav a:hover{color:var(--accent);opacity:1}
-main{max-width:900px;margin:0 auto;padding:16px}
-.card{background:var(--card);border-radius:14px;padding:16px;margin-bottom:16px;box-shadow:0 2px 8px rgba(0,0,0,.4)}
-h2{margin:0 0 12px;font-size:15px;color:var(--accent);text-transform:uppercase;letter-spacing:.06em}
-.row{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
-.big{font-size:34px;font-weight:700}
-.unit{font-size:15px;opacity:.7;margin-left:4px}
-.green{color:var(--ok)} .amber{color:var(--warn)} .red{color:var(--err)}
-button{cursor:pointer;border:0;border-radius:10px;padding:10px 16px;font-size:14px;font-weight:600;background:var(--accent);color:#0b1220;min-height:44px}
-button.alt{background:#475569;color:var(--fg)}
-button.danger{background:var(--err);color:#fff}
-input,select{background:#0b1220;border:1px solid #334155;color:var(--fg);border-radius:8px;padding:10px;font-size:14px;min-height:44px;width:100%}
-label{display:block;font-size:12px;opacity:.75;margin:10px 0 4px}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}
-.badge{display:inline-block;padding:3px 9px;border-radius:999px;font-size:12px;font-weight:600}
-.badge.on{background:#14532d;color:#86efac} .badge.off{background:#3f1d1d;color:#fca5a5}
-.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#334155;color:#fff;padding:10px 18px;border-radius:10px;opacity:0;transition:opacity .3s;pointer-events:none;font-size:14px;z-index:100}
-.toast.show{opacity:1}
-footer{text-align:center;padding:16px;font-size:12px;opacity:.5}
-@media(max-width:520px){nav a{margin-left:10px;font-size:13px}header h1{font-size:14px}.big{font-size:28px}}
-</style></head><body>)HTML";
-
-static const char PAGE_NAV[] PROGMEM = R"HTML(<header><h1>ESP32 SHT31</h1><nav>
-<a href="/">Dashboard</a><a href="/relay">Relay</a><a href="/alarm">Alarm</a><a href="/wifi">WiFi</a>
-</nav></header><main>)HTML";
-
-static const char PAGE_FOOT[] PROGMEM = R"HTML(</main><footer>ESP32 &middot; SHT31 &middot; PROGMEM UI</footer>
-<div class="toast" id="t"></div>
-<script>
-function toast(m){var t=document.getElementById('t');t.textContent=m;t.classList.add('show');setTimeout(function(){t.classList.remove('show')},1800)}
-function post(url,data){return fetch(url,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:data}).then(r=>r.json())}
-</script></body></html>)HTML";
-
-static const char PAGE_DASH[] PROGMEM = R"HTML(<div class="card">
-<h2>Live Sensor (SHT31)</h2>
-<div class="grid">
-<div><div>Temperature</div><span class="big" id="tc">--</span><span class="unit">&deg;C</span></div>
-<div><div>Humidity</div><span class="big" id="hc">--</span><span class="unit">%RH</span></div>
-</div>
-<div class="row" style="margin-top:12px">
-<span>Sensor:</span><span id="sok" class="badge off">unknown</span>
-<span style="margin-left:auto">Relay:</span><span id="rs" class="badge off">off</span>
-<span style="margin-left:12px">Alarm:</span><span id="as" class="badge off">off</span>
-</div>
-</div>
-<div class="card">
-<h2>Thresholds</h2>
-<div class="grid">
-<div><label>Trigger source</label>
-<select id="tm">
-<option value="0">Temperature</option><option value="1">Humidity</option>
-<option value="2">Either</option><option value="3">Both</option></select></div>
-<div><label>Temp threshold (&deg;C)</label><input id="tt" type="number" step="0.1"></div>
-<div><label>Hum threshold (%RH)</label><input id="ht" type="number" step="0.1"></div>
-<div><label>Temp hysteresis</label><input id="th" type="number" step="0.1"></div>
-<div><label>Hum hysteresis</label><input id="hh" type="number" step="0.1"></div>
-</div>
-<div class="row" style="margin-top:12px">
-<button onclick="saveThr()">Save Thresholds</button>
-</div>
-</div>
-<script>
-function val(id){return document.getElementById(id).value}
-function set(id,v){document.getElementById(id).value=v}
-function refresh(){
- fetch('/api/status').then(r=>r.json()).then(d=>{
-  document.getElementById('tc').textContent = d.sensorOk?d.temp.toFixed(2):'--';
-  document.getElementById('hc').textContent = d.sensorOk?d.hum.toFixed(2):'--';
-  var s=document.getElementById('sok'); s.textContent=d.sensorOk?'OK':'FAULT';
-  s.className='badge '+(d.sensorOk?'on':'off');
-  var r=document.getElementById('rs'); r.textContent=d.relay?'ON':'OFF';
-  r.className='badge '+(d.relay?'on':'off');
-  var a=document.getElementById('as'); a.textContent=d.alarm?'ON':'OFF';
-  a.className='badge '+(d.alarm?'on':'off');
-  if(!document.activeElement || document.activeElement.tagName!=='INPUT'){
-   set('tm',d.trigMode); set('tt',d.tempThr); set('ht',d.humThr);
-   set('th',d.tempHyst); set('hh',d.humHyst);
-  }
- }).catch(()=>{});
-}
-function saveThr(){
- var body='tm='+val('tm')+'&tt='+val('tt')+'&ht='+val('ht')+'&th='+val('th')+'&hh='+val('hh');
- post('/api/thresholds',body)
-   .then(d=>{toast(d.ok?'Saved':'Failed: '+(d.err||'unknown'))})
-   .catch(()=>{toast('Network error')});
-}
-refresh(); setInterval(refresh,2500);
-</script>)HTML";
-
-static const char PAGE_RELAY[] PROGMEM = R"HTML(<div class="card">
-<h2>Relay (GPIO25)</h2>
-<div class="row"><span>State:</span><span id="rs" class="badge off">--</span></div>
-<label>Wiring polarity</label>
-<select id="pol" onchange="savePol()">
-<option value="1">Active HIGH</option><option value="0">Active LOW</option>
-</select>
-<label>Mode</label>
-<select id="mode" onchange="saveMode()">
-<option value="0">Auto (threshold)</option>
-<option value="1">Force ON</option>
-<option value="2">Force OFF</option>
-</select>
-<div class="row" style="margin-top:12px">
-<button class="alt" onclick="saveMode()">Apply Mode</button>
-</div>
-</div>
-<script>
-function refresh(){
- fetch('/api/status').then(r=>r.json()).then(d=>{
-  var s=document.getElementById('rs'); s.textContent=d.relay?'ON':'OFF';
-  s.className='badge '+(d.relay?'on':'off');
-  document.getElementById('pol').value=d.relayActiveHigh?1:0;
-  document.getElementById('mode').value=d.relayManual;
- }).catch(()=>{});
-}
-function savePol(){post('/api/relay',(document.getElementById('pol').value==1?'pol=1':'pol=0')).then(d=>toast(d.ok?'Saved':'Failed: '+(d.err||'unknown'))).catch(()=>toast('Network error'))}
-function saveMode(){post('/api/relay','mode='+document.getElementById('mode').value).then(d=>toast(d.ok?'Saved':'Failed: '+(d.err||'unknown'))).catch(()=>toast('Network error'))}
-refresh(); setInterval(refresh,2500);
-</script>)HTML";
-
-static const char PAGE_ALARM[] PROGMEM = R"HTML(<div class="card">
-<h2>Alarm (GPIO26)</h2>
-<div class="row"><span>State:</span><span id="as" class="badge off">--</span></div>
-<label>Wiring polarity</label>
-<select id="pol" onchange="savePol()">
-<option value="1">Active HIGH</option><option value="0">Active LOW</option>
-</select>
-<label>Mode</label>
-<select id="mode" onchange="saveMode()">
-<option value="0">Auto (mirror relay + fault)</option>
-<option value="1">Force ON</option>
-<option value="2">Force OFF</option>
-</select>
-<div class="row" style="margin-top:12px">
-<button class="alt" onclick="saveMode()">Apply Mode</button>
-</div>
-<p style="font-size:12px;opacity:.6;margin-top:12px">Auto mode: alarm ON when relay output is ON, or when the sensor has been in fault for 30 s or more.</p>
-</div>
-<script>
-function refresh(){
- fetch('/api/status').then(r=>r.json()).then(d=>{
-  var s=document.getElementById('as'); s.textContent=d.alarm?'ON':'OFF';
-  s.className='badge '+(d.alarm?'on':'off');
-  document.getElementById('pol').value=d.alarmActiveHigh?1:0;
-  document.getElementById('mode').value=d.alarmManual;
- }).catch(()=>{});
-}
-function savePol(){post('/api/alarm',(document.getElementById('pol').value==1?'pol=1':'pol=0')).then(d=>toast(d.ok?'Saved':'Failed: '+(d.err||'unknown'))).catch(()=>toast('Network error'))}
-function saveMode(){post('/api/alarm','mode='+document.getElementById('mode').value).then(d=>toast(d.ok?'Saved':'Failed: '+(d.err||'unknown'))).catch(()=>toast('Network error'))}
-refresh(); setInterval(refresh,2500);
-</script>)HTML";
-
-static const char PAGE_WIFI[] PROGMEM = R"HTML(<div class="card">
-<h2>WiFi AP</h2>
-<div class="row"><span>Status:</span><span id="ap" class="badge off">--</span></div>
-<label>SSID (max 32 chars)</label>
-<input id="ssid" maxlength="32" autocomplete="off">
-<label>Password (8-63 chars)</label>
-<input id="pass" type="password" maxlength="63" autocomplete="new-password">
-<div class="row" style="margin-top:12px">
-<button onclick="saveWifi()">Save &amp; Restart AP</button>
-</div>
-<p style="font-size:12px;opacity:.6;margin-top:12px">AP is always active. Saving restarts the AP with the new credentials.</p>
-</div>
-<div class="card">
-<h2>Factory Reset</h2>
-<p style="font-size:13px;opacity:.7">Press and hold the onboard BOOT (GPIO0) button for 5 seconds <b>after</b> the device has booted. Holding it during power-on will enter bootloader mode and will not trigger a reset.</p>
-<button class="danger" onclick="factory()">Factory Reset Now</button>
-</div>
-<script>
-function refresh(){
- fetch('/api/status').then(r=>r.json()).then(d=>{
-  var a=document.getElementById('ap'); a.textContent=d.ap?'RUNNING':'DOWN';
-  a.className='badge '+(d.ap?'on':'off');
-  if(document.activeElement!==document.getElementById('ssid')) document.getElementById('ssid').value=d.ssid;
- }).catch(()=>{});
-}
-function saveWifi(){
- var b='ssid='+encodeURIComponent(document.getElementById('ssid').value)+'&pass='+encodeURIComponent(document.getElementById('pass').value);
- post('/api/wifi',b)
-   .then(d=>{toast(d.ok?'Saved, restarting AP — reconnect to the new SSID':'Failed: '+(d.err||'unknown'))})
-   .catch(()=>{toast('No response — AP may have restarted; check device')});
-}
-function factory(){if(confirm('Factory reset?')){fetch('/api/factory',{method:'POST'}).then(r=>r.json().catch(()=>({}))).then(d=>{toast(d&&d.ok?'Rebooting...':'Reset failed — device not rebooted')}).catch(()=>toast('No response — check device'))}}
-refresh(); setInterval(refresh,2500);
-</script>)HTML";
-
-static const char PAGE_404[] PROGMEM = R"HTML(<div class="card"><h2>Not Found</h2><p>Go to <a href="/" style="color:#38bdf8">Dashboard</a></p></div>)HTML";
-
-static void sendPgPart(PGM_P p) {
-  size_t len = strlen_P(p);
-  if (len == 0) return;
-  char chunk[256];
-  size_t off = 0;
-  while (off < len) {
-    size_t n = (len - off) < sizeof(chunk) ? (len - off) : sizeof(chunk);
-    memcpy_P(chunk, p + off, n);
-    g_server.sendContent(chunk, n);
-    off += n;
-  }
-}
-
-static void sendPage(PGM_P const* parts, size_t count) {
-  size_t total = 0;
-  for (size_t i = 0; i < count; i++) total += strlen_P(parts[i]);
-  g_server.sendHeader("Cache-Control", "no-store");
-  g_server.sendHeader("Connection", "close");
-  g_server.setContentLength(total);
-  g_server.send(200, "text/html; charset=utf-8", "");
-  for (size_t i = 0; i < count; i++) sendPgPart(parts[i]);
-}
-
-static uint8_t sht_crc8(uint8_t hi, uint8_t lo) {
-  uint8_t crc = 0xFF;
-  uint8_t bytes[2] = { hi, lo };
-  for (int i = 0; i < 2; i++) {
-    crc ^= bytes[i];
-    for (int b = 0; b < 8; b++)
-      crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0x31) : (uint8_t)(crc << 1);
   }
   return crc;
 }
 
-static bool sht_start() {
-  Wire.beginTransmission(SHT31_ADDR);
-  Wire.write((uint8_t)0x24);
-  Wire.write((uint8_t)0x00);
-  if (Wire.endTransmission() != 0) return false;
-  sht_convStart = millis();
-  sht_phase = 1;
-  return true;
-}
-
-static int sht_poll(float& t, float& h) {
-  if (sht_phase != 1) return 0;
-  if ((uint32_t)(millis() - sht_convStart) < SHT_CONV_WAIT_MS) return 0;
-
-  sht_phase = 0;
-
-  if (Wire.requestFrom((uint8_t)SHT31_ADDR, (uint8_t)6) != 6) return -1;
-  uint8_t d[6];
-  for (int i = 0; i < 6; i++) d[i] = Wire.read();
-
-  if (sht_crc8(d[0], d[1]) != d[2]) return -2;
-  if (sht_crc8(d[3], d[4]) != d[5]) return -2;
-
-  uint16_t rawT = ((uint16_t)d[0] << 8) | d[1];
-  uint16_t rawH = ((uint16_t)d[3] << 8) | d[4];
-  t = -45.0f + 175.0f * (float)rawT / 65535.0f;
-  h = 100.0f * (float)rawH / 65535.0f;
-  return 1;
-}
-
-static bool g_relayAutoState = false;
-
-static void relay_apply(bool physicalOn) {
-  g_relayState = physicalOn;
-  bool level = g_cfg.relayActiveHigh ? physicalOn : !physicalOn;
-  digitalWrite(RELAY_PIN, level ? HIGH : LOW);
-}
-
-static void alarm_apply(bool physicalOn) {
-  g_alarmState = physicalOn;
-  bool level = g_alarmActiveHigh ? physicalOn : !physicalOn;
-  digitalWrite(ALARM_PIN, level ? HIGH : LOW);
-}
-
-static void alarm_update() {
-  bool physical;
-  if (g_alarmManual == 1) {
-    physical = true;
-  } else if (g_alarmManual == 2) {
-    physical = false;
-  } else {
-    bool faultAlarm = (!g_sensorOk && g_sensorFaultSince != 0 &&
-                       (uint32_t)(millis() - g_sensorFaultSince) >= SENSOR_FAULT_TIMEOUT_MS);
-    physical = g_relayState || faultAlarm;
-  }
-  alarm_apply(physical);
-}
-
-static bool thresholdEval() {
-  if (!g_sensorOk) return g_relayAutoState;
-
-  bool tTrig = false, hTrig = false;
-  switch (g_cfg.trigMode) {
-    case 0: tTrig = g_tempC >= g_cfg.tempThreshold; break;
-    case 1: hTrig = g_humPct >= g_cfg.humThreshold; break;
-    case 2:
-    case 3:
-      tTrig = g_tempC >= g_cfg.tempThreshold;
-      hTrig = g_humPct >= g_cfg.humThreshold;
-      break;
-  }
-
-  bool on;
-  switch (g_cfg.trigMode) {
-    case 0: on = tTrig;               break;
-    case 1: on = hTrig;               break;
-    case 2: on = tTrig || hTrig;      break;
-    case 3: on = tTrig && hTrig;      break;
-    default: on = false;              break;
-  }
-
-  if (g_relayAutoState) {
-    bool stillT = g_tempC >= (g_cfg.tempThreshold - g_cfg.tempHyst);
-    bool stillH = g_humPct >= (g_cfg.humThreshold - g_cfg.humHyst);
-    switch (g_cfg.trigMode) {
-      case 0: on = stillT;              break;
-      case 1: on = stillH;              break;
-      case 2: on = stillT || stillH;    break;
-      case 3: on = stillT && stillH;    break;
-      default: on = false;              break;
-    }
-  }
-  return on;
-}
-
-static void relay_update() {
-  bool physical;
-  if (g_cfg.relayManual == 1) {
-    physical = true;
-  } else if (g_cfg.relayManual == 2) {
-    physical = false;
-  } else if (!g_sensorOk && g_sensorFaultSince != 0 &&
-             (uint32_t)(millis() - g_sensorFaultSince) >= SENSOR_FAULT_TIMEOUT_MS) {
-    physical = false;
-  } else {
-    g_relayAutoState = thresholdEval();
-    physical = g_relayAutoState;
-  }
-  relay_apply(physical);
-}
-
-static bool ap_start() {
-  WiFi.mode(WIFI_AP);
-  WiFi.softAPdisconnect(true);
-  delay(50);
-
-  g_apRunning = WiFi.softAP(g_cfg.apSsid, g_cfg.apPass, 1, 0, 4);
-  if (!g_apRunning) {
-    delay(150);
-    g_apRunning = WiFi.softAP(g_cfg.apSsid, g_cfg.apPass, 1, 0, 4);
-  }
-  if (g_apRunning) {
-    IPAddress ip = WiFi.softAPIP();
-    g_dns.stop();
-    g_dns.setErrorReplyCode(DNSReplyCode::NoError);
-    g_dns.start(53, "*", ip);
-  }
-  return g_apRunning;
-}
-
-static void ap_ensure() {
-  if (!g_apRunning) {
-    ap_start();
-    g_apIpZeroCount = 0;
-    if (g_apRunning) g_dnsIp = WiFi.softAPIP();
+static void jsonEscape(char* dst, size_t dstSize, const char* src) {
+  if (!dst || dstSize == 0) {
     return;
   }
-  IPAddress ip = WiFi.softAPIP();
-  if (ip == IPAddress(0, 0, 0, 0)) {
-    if (++g_apIpZeroCount >= 3) {
-      ap_start();
-      g_apIpZeroCount = 0;
-      if (g_apRunning) g_dnsIp = WiFi.softAPIP();
+  size_t j = 0;
+  for (size_t i = 0; src[i] != 0 && j + 1 < dstSize; ++i) {
+    unsigned char c = (unsigned char)src[i];
+    if (c == '"' || c == '\\') {
+      if (j + 2 >= dstSize) {
+        break;
+      }
+      dst[j++] = '\\';
+      dst[j++] = (char)c;
+    } else if (c == '\n') {
+      if (j + 2 >= dstSize) {
+        break;
+      }
+      dst[j++] = '\\';
+      dst[j++] = 'n';
+    } else if (c == '\r') {
+      if (j + 2 >= dstSize) {
+        break;
+      }
+      dst[j++] = '\\';
+      dst[j++] = 'r';
+    } else if (c == '\t') {
+      if (j + 2 >= dstSize) {
+        break;
+      }
+      dst[j++] = '\\';
+      dst[j++] = 't';
+    } else if (c < 0x20) {
+      dst[j++] = '?';
+    } else {
+      dst[j++] = (char)c;
     }
-    return;
   }
-  g_apIpZeroCount = 0;
-  if (ip != g_dnsIp) {
-    g_dns.stop();
-    g_dns.setErrorReplyCode(DNSReplyCode::NoError);
-    g_dns.start(53, "*", ip);
-    g_dnsIp = ip;
-  }
+  dst[j] = 0;
 }
 
-static void addCors() { g_server.sendHeader("Cache-Control", "no-store"); }
-
-static void handleRoot() {
-  static PGM_P const parts[] = { PAGE_HEAD, PAGE_NAV, PAGE_DASH, PAGE_FOOT };
-  sendPage(parts, sizeof(parts) / sizeof(parts[0]));
+static void setDefaultConfig(Config& c) {
+  memset(&c, 0, sizeof(c));
+  c.magic = CONFIG_MAGIC;
+  c.version = CONFIG_VERSION;
+  c.size = sizeof(Config);
+  c.seq = 0;
+  c.tempOffsetCenti = 0;
+  c.humOffsetCenti = 0;
+  c.relayThresholdCenti = 3000;
+  c.relayHysteresisCenti = 100;
+  c.relayMinSwitchMs = 1000ULL;
+  c.sampleIntervalMs = 2000ULL;
+  copyStr(c.ssid, sizeof(c.ssid), DEFAULT_SSID);
+  copyStr(c.password, sizeof(c.password), DEFAULT_PASS);
+  c.channel = 1;
+  c.hidden = 0;
+  c.relayEnabled = 0;
+  c.relaySource = 0;
+  c.relayComparator = 0;
+  c.relayActiveLow = 0;
+  c.relayManual = 0;
+  c.relayFailSafe = 0;
+  c.reserved[0] = 0;
+  c.reserved[1] = 0;
+  c.crc32 = crc32Calc((const uint8_t*)&c, offsetof(Config, crc32));
 }
 
-static void handleRelayPage() {
-  static PGM_P const parts[] = { PAGE_HEAD, PAGE_NAV, PAGE_RELAY, PAGE_FOOT };
-  sendPage(parts, sizeof(parts) / sizeof(parts[0]));
-}
-
-static void handleAlarmPage() {
-  static PGM_P const parts[] = { PAGE_HEAD, PAGE_NAV, PAGE_ALARM, PAGE_FOOT };
-  sendPage(parts, sizeof(parts) / sizeof(parts[0]));
-}
-
-static void handleWifiPage() {
-  static PGM_P const parts[] = { PAGE_HEAD, PAGE_NAV, PAGE_WIFI, PAGE_FOOT };
-  sendPage(parts, sizeof(parts) / sizeof(parts[0]));
-}
-
-static void handle404() {
-  static PGM_P const parts[] = { PAGE_HEAD, PAGE_NAV, PAGE_404, PAGE_FOOT };
-  size_t total = 0;
-  for (size_t i = 0; i < sizeof(parts) / sizeof(parts[0]); i++) total += strlen_P(parts[i]);
-  g_server.sendHeader("Cache-Control", "no-store");
-  g_server.sendHeader("Connection", "close");
-  g_server.setContentLength(total);
-  g_server.send(404, "text/html; charset=utf-8", "");
-  for (size_t i = 0; i < sizeof(parts) / sizeof(parts[0]); i++) sendPgPart(parts[i]);
-}
-
-static void handleStatus() {
-  char buf[640];
-  (void)snprintf(buf, sizeof(buf),
-    "{\"temp\":%.2f,\"hum\":%.2f,\"sensorOk\":%s,\"relay\":%s,\"alarm\":%s,"
-    "\"trigMode\":%u,\"tempThr\":%.2f,\"humThr\":%.2f,"
-    "\"tempHyst\":%.2f,\"humHyst\":%.2f,"
-    "\"relayActiveHigh\":%u,\"relayManual\":%u,"
-    "\"alarmActiveHigh\":%u,\"alarmManual\":%u,"
-    "\"ap\":%s,\"ssid\":\"%s\"}",
-    isnan(g_tempC) ? 0.0f : g_tempC, isnan(g_humPct) ? 0.0f : g_humPct,
-    g_sensorOk ? "true" : "false",
-    g_relayState ? "true" : "false",
-    g_alarmState ? "true" : "false",
-    g_cfg.trigMode, g_cfg.tempThreshold, g_cfg.humThreshold,
-    g_cfg.tempHyst, g_cfg.humHyst,
-    g_cfg.relayActiveHigh, g_cfg.relayManual,
-    g_alarmActiveHigh ? 1 : 0, g_alarmManual,
-    g_apRunning ? "true" : "false", g_cfg.apSsid);
-  addCors();
-  g_server.send(200, "application/json", buf);
-}
-
-static bool parseFloatStrict(const String& s, float& out) {
-  if (s.length() == 0) return false;
-  bool dot = false, digit = false;
-  for (size_t i = 0; i < s.length(); i++) {
-    char ch = s[i];
-    if (ch == '-' && i == 0) continue;
-    if (ch == '.' && !dot) { dot = true; continue; }
-    if (ch >= '0' && ch <= '9') { digit = true; continue; }
+static bool validateAndSanitizeConfig(Config& c) {
+  if (c.magic != CONFIG_MAGIC || c.version != CONFIG_VERSION || c.size != sizeof(Config)) {
     return false;
   }
-  if (!digit) return false;
-  out = s.toFloat();
+
+  size_t ssidLen = boundedStrLen(c.ssid, sizeof(c.ssid));
+  if (ssidLen == 0 || ssidLen > 32) {
+    return false;
+  }
+
+  size_t passLen = boundedStrLen(c.password, sizeof(c.password));
+  if (passLen < 8 || passLen > 63) {
+    return false;
+  }
+
+  for (size_t i = 0; i < ssidLen; ++i) {
+    uint8_t ch = (uint8_t)c.ssid[i];
+    if (ch < 0x20 || ch > 0x7E) {
+      return false;
+    }
+  }
+
+  for (size_t i = 0; i < passLen; ++i) {
+    uint8_t ch = (uint8_t)c.password[i];
+    if (ch < 0x20 || ch > 0x7E) {
+      return false;
+    }
+  }
+
+  c.channel = (uint8_t)clampValue<int>((int)c.channel, 1, 13);
+  c.hidden = c.hidden ? 1 : 0;
+  c.relayEnabled = c.relayEnabled ? 1 : 0;
+  c.relaySource = c.relaySource > 1 ? 0 : c.relaySource;
+  c.relayComparator = c.relayComparator > 1 ? 0 : c.relayComparator;
+  c.relayActiveLow = c.relayActiveLow ? 1 : 0;
+  c.relayManual = c.relayManual > 2 ? 0 : c.relayManual;
+  c.relayFailSafe = c.relayFailSafe ? 1 : 0;
+
+  c.relayMinSwitchMs = clampValue<uint64_t>(c.relayMinSwitchMs, 0ULL, 600000ULL);
+  c.sampleIntervalMs = clampValue<uint64_t>(c.sampleIntervalMs, 1000ULL, 600000ULL);
+  c.tempOffsetCenti = clampValue<int64_t>(c.tempOffsetCenti, -1000LL, 1000LL);
+  c.humOffsetCenti = clampValue<int64_t>(c.humOffsetCenti, -2000LL, 2000LL);
+  if (c.relaySource == 1) {
+    c.relayThresholdCenti = clampValue<int64_t>(c.relayThresholdCenti, 0LL, 10000LL);
+  } else {
+    c.relayThresholdCenti = clampValue<int64_t>(c.relayThresholdCenti, -10000LL, 20000LL);
+  }
+  c.relayHysteresisCenti = clampValue<int64_t>(c.relayHysteresisCenti, 0LL, 5000LL);
+  c.reserved[0] = 0;
+  c.reserved[1] = 0;
   return true;
 }
 
-static void handleThresholds() {
-  if (!g_server.hasArg("tm") || !g_server.hasArg("tt") ||
-      !g_server.hasArg("ht") || !g_server.hasArg("th") || !g_server.hasArg("hh")) {
-    g_server.send(400, "application/json", "{\"ok\":false,\"err\":\"args\"}");
-    return;
-  }
-  float tt, ht, th, hh;
-  if (!parseFloatStrict(g_server.arg("tt"), tt) ||
-      !parseFloatStrict(g_server.arg("ht"), ht) ||
-      !parseFloatStrict(g_server.arg("th"), th) ||
-      !parseFloatStrict(g_server.arg("hh"), hh)) {
-    g_server.send(400, "application/json", "{\"ok\":false,\"err\":\"num\"}");
-    return;
-  }
-  Config c = g_cfg;
-  c.trigMode      = (uint8_t)constrain(g_server.arg("tm").toInt(), 0, 3);
-  c.tempThreshold = tt;
-  c.humThreshold  = ht;
-  c.tempHyst      = fabsf(th);
-  c.humHyst       = fabsf(hh);
-  cfg_finalize(c);
-  bool saved = cfg_saveIfChanged(c);
-  if (saved) g_cfg = c;
-  relay_update();
-  alarm_update();
-  g_server.send(saved ? 200 : 500, "application/json",
-                saved ? "{\"ok\":true}" : "{\"ok\":false,\"err\":\"nvs\"}");
+static bool configFieldsEqual(const Config& a, const Config& b) {
+  Config x = a;
+  Config y = b;
+  x.seq = 0;
+  y.seq = 0;
+  x.crc32 = 0;
+  y.crc32 = 0;
+  return memcmp(&x, &y, sizeof(Config)) == 0;
 }
 
-static void handleRelayApi() {
-  Config c = g_cfg;
-  if (g_server.hasArg("pol")) c.relayActiveHigh = g_server.arg("pol").toInt() ? 1 : 0;
-  if (g_server.hasArg("mode")) c.relayManual = (uint8_t)constrain(g_server.arg("mode").toInt(), 0, 2);
-  cfg_finalize(c);
-  bool saved = cfg_saveIfChanged(c);
-  if (saved) g_cfg = c;
-  relay_update();
-  alarm_update();
-  g_server.send(saved ? 200 : 500, "application/json",
-                saved ? "{\"ok\":true}" : "{\"ok\":false,\"err\":\"nvs\"}");
+static bool readConfigSlot(const char* key, Config& out) {
+  Preferences p;
+  if (!p.begin(CONFIG_NS, true)) {
+    return false;
+  }
+  size_t len = p.getBytesLength(key);
+  if (len != sizeof(Config)) {
+    p.end();
+    return false;
+  }
+  size_t got = p.getBytes(key, &out, sizeof(out));
+  p.end();
+  if (got != sizeof(out)) {
+    return false;
+  }
+  if (out.magic != CONFIG_MAGIC || out.version != CONFIG_VERSION || out.size != sizeof(Config)) {
+    return false;
+  }
+  uint32_t stored = out.crc32;
+  uint32_t calc = crc32Calc((const uint8_t*)&out, offsetof(Config, crc32));
+  if (stored != calc) {
+    return false;
+  }
+  return validateAndSanitizeConfig(out);
 }
 
-static void handleAlarmApi() {
-  bool pol = g_alarmActiveHigh;
-  uint8_t man = g_alarmManual;
-  if (g_server.hasArg("pol")) pol = g_server.arg("pol").toInt() ? true : false;
-  if (g_server.hasArg("mode")) man = (uint8_t)constrain(g_server.arg("mode").toInt(), 0, 2);
-  g_alarmActiveHigh = pol;
-  g_alarmManual = man;
-  bool saved = alarm_saveNVS();
-  if (!saved) {
-    alarm_loadNVS();
+static void loadConfig() {
+  Config a;
+  Config b;
+  bool va = readConfigSlot("slotA", a);
+  bool vb = readConfigSlot("slotB", b);
+
+  if (va && vb) {
+    if (a.seq >= b.seq) {
+      gConfig = a;
+      gActiveSlot = 1;
+      gConfigSeq = a.seq;
+    } else {
+      gConfig = b;
+      gActiveSlot = 2;
+      gConfigSeq = b.seq;
+    }
+  } else if (va) {
+    gConfig = a;
+    gActiveSlot = 1;
+    gConfigSeq = a.seq;
+  } else if (vb) {
+    gConfig = b;
+    gActiveSlot = 2;
+    gConfigSeq = b.seq;
+  } else {
+    setDefaultConfig(gConfig);
+    gActiveSlot = 0;
+    gConfigSeq = gConfig.seq;
   }
-  alarm_update();
-  g_server.send(saved ? 200 : 500, "application/json",
-                saved ? "{\"ok\":true}" : "{\"ok\":false,\"err\":\"nvs\"}");
 }
 
-static void handleWifiApi() {
-  if (!g_server.hasArg("ssid") || !g_server.hasArg("pass")) {
-    g_server.send(400, "application/json", "{\"ok\":false,\"err\":\"args\"}");
-    return;
+static bool saveConfigIfChanged(Config newCfg, bool& changed) {
+  changed = false;
+  if (!validateAndSanitizeConfig(newCfg)) {
+    return false;
   }
-  String ssid = g_server.arg("ssid");
-  String pass = g_server.arg("pass");
+  if (configFieldsEqual(newCfg, gConfig)) {
+    return true;
+  }
 
-  if (ssid.length() == 0 || ssid.length() > 32) {
-    g_server.send(400, "application/json", "{\"ok\":false,\"err\":\"ssidrange\"}");
+  Config c = newCfg;
+  c.magic = CONFIG_MAGIC;
+  c.version = CONFIG_VERSION;
+  c.size = sizeof(Config);
+  c.seq = (gConfigSeq == UINT64_MAX) ? 1ULL : (gConfigSeq + 1ULL);
+  c.reserved[0] = 0;
+  c.reserved[1] = 0;
+  c.crc32 = 0;
+  c.crc32 = crc32Calc((const uint8_t*)&c, offsetof(Config, crc32));
+
+  uint8_t target = (gActiveSlot == 1) ? 2 : 1;
+  const char* key = (target == 1) ? "slotA" : "slotB";
+
+  Preferences p;
+  if (!p.begin(CONFIG_NS, false)) {
+    return false;
+  }
+  size_t written = p.putBytes(key, &c, sizeof(c));
+  p.end();
+
+  if (written != sizeof(c)) {
+    return false;
+  }
+
+  gConfig = c;
+  gActiveSlot = target;
+  gConfigSeq = c.seq;
+  changed = true;
+  return true;
+}
+
+static bool sensorDataFresh(uint64_t now) {
+  if (lastValidSensorUs == 0) {
+    return false;
+  }
+  uint64_t staleMs = gConfig.sampleIntervalMs * 3ULL;
+  if (staleMs < 10000ULL) {
+    staleMs = 10000ULL;
+  }
+  return (now >= lastValidSensorUs) && ((now - lastValidSensorUs) <= (staleMs * 1000ULL));
+}
+
+static void sensorReadFailed(uint64_t now) {
+  sensorOk = false;
+  sensorFailCount++;
+  sensorErrorCount++;
+  if (sensorFailCount >= 3) {
+    sensorAddr = (sensorAddr == SHT31_ADDR_A) ? SHT31_ADDR_B : SHT31_ADDR_A;
+    sensorFailCount = 0;
+  }
+  uint64_t retry = gConfig.sampleIntervalMs * 1000ULL;
+  if (retry < SENSOR_RETRY_US) {
+    retry = SENSOR_RETRY_US;
+  }
+  nextSensorTriggerUs = now + retry;
+}
+
+static void triggerSensor(uint64_t now) {
+  Wire.beginTransmission(sensorAddr);
+  Wire.write((uint8_t)0x24);
+  Wire.write((uint8_t)0x00);
+  if (Wire.endTransmission() != 0) {
+    sensorState = SENSOR_IDLE;
+    sensorReadFailed(now);
     return;
   }
-  for (size_t i = 0; i < ssid.length(); i++) {
-    char ch = ssid[i];
-    if (ch < 0x20 || ch > 0x7E || ch == '"' || ch == '\\') {
-      g_server.send(400, "application/json", "{\"ok\":false,\"err\":\"ssidchar\"}");
+  sensorMeasureStartUs = nowUs();
+  sensorState = SENSOR_WAIT;
+}
+
+static void updateSensor(uint64_t now) {
+  if (sensorState == SENSOR_IDLE) {
+    if (now >= nextSensorTriggerUs) {
+      triggerSensor(now);
+    }
+    return;
+  }
+
+  if (sensorState != SENSOR_WAIT) {
+    sensorState = SENSOR_IDLE;
+    return;
+  }
+
+  if (now < sensorMeasureStartUs) {
+    return;
+  }
+
+  uint64_t elapsed = now - sensorMeasureStartUs;
+  if (elapsed < SHT31_MEASUREMENT_WAIT_US) {
+    return;
+  }
+
+  bool success = false;
+
+  if (Wire.requestFrom((int)sensorAddr, 6) == 6) {
+    uint8_t b[6];
+    for (uint8_t i = 0; i < 6; ++i) {
+      b[i] = (uint8_t)Wire.read();
+    }
+
+    if (sht31Crc(b, 2) == b[2] && sht31Crc(&b[3], 2) == b[5]) {
+      uint16_t traw = ((uint16_t)b[0] << 8) | b[1];
+      uint16_t hraw = ((uint16_t)b[3] << 8) | b[4];
+
+      int64_t t = -4500LL + (int64_t)((17500ULL * (uint64_t)traw) / 65535ULL);
+      int64_t h = (int64_t)((10000ULL * (uint64_t)hraw) / 65535ULL);
+
+      t += gConfig.tempOffsetCenti;
+      h += gConfig.humOffsetCenti;
+
+      if (h < 0) {
+        h = 0;
+      }
+      if (h > 10000) {
+        h = 10000;
+      }
+
+      tempCenti = t;
+      humCenti = h;
+      lastSensorReadUs = now;
+      lastValidSensorUs = now;
+      sensorOk = true;
+      sensorFailCount = 0;
+      sensorReadCount++;
+      success = true;
+    }
+  }
+
+  sensorState = SENSOR_IDLE;
+
+  if (success) {
+    nextSensorTriggerUs = now + (gConfig.sampleIntervalMs * 1000ULL);
+  } else {
+    sensorReadFailed(now);
+  }
+}
+
+static void updateRelay(bool force, uint64_t now) {
+  bool fresh = sensorDataFresh(now);
+  bool desired = relayOn;
+
+  if (!gConfig.relayEnabled) {
+    desired = false;
+  } else if (gConfig.relayManual == 1) {
+    desired = false;
+  } else if (gConfig.relayManual == 2) {
+    desired = true;
+  } else if (!fresh) {
+    desired = (gConfig.relayFailSafe != 0);
+  } else {
+    int64_t value = (gConfig.relaySource == 0) ? tempCenti : humCenti;
+    int64_t threshold = gConfig.relayThresholdCenti;
+    int64_t hyst = gConfig.relayHysteresisCenti;
+
+    if (gConfig.relayComparator == 0) {
+      if (!relayOn) {
+        desired = (value >= threshold);
+      } else {
+        desired = (value >= (threshold - hyst));
+      }
+    } else {
+      if (!relayOn) {
+        desired = (value <= threshold);
+      } else {
+        desired = (value <= (threshold + hyst));
+      }
+    }
+  }
+
+  bool hard = force || !gConfig.relayEnabled || gConfig.relayManual != 0 || !fresh;
+
+  if (desired != relayOn) {
+    bool allow = hard || lastRelaySwitchUs == 0;
+    if (!allow) {
+      uint64_t minUs = gConfig.relayMinSwitchMs * 1000ULL;
+      allow = (now - lastRelaySwitchUs) >= minUs;
+    }
+    if (allow) {
+      relayOn = desired;
+      lastRelaySwitchUs = now;
+    }
+  }
+
+  bool high = gConfig.relayActiveLow ? !relayOn : relayOn;
+  uint8_t level = high ? HIGH : LOW;
+  if (level != relayPhysical) {
+    digitalWrite(PIN_RELAY, level);
+    relayPhysical = level;
+  }
+}
+
+static void applyAPSettings() {
+  dnsServer.stop();
+
+  IPAddress local(192, 168, 4, 1);
+  IPAddress gateway(192, 168, 4, 1);
+  IPAddress subnet(255, 255, 255, 0);
+
+  WiFi.persistent(false);
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_AP);
+  WiFi.setSleep(false);
+  WiFi.softAPConfig(local, gateway, subnet);
+
+  bool ok = WiFi.softAP(
+    gConfig.ssid,
+    gConfig.password,
+    gConfig.channel,
+    gConfig.hidden ? 1 : 0,
+    MAX_AP_CLIENTS
+  );
+
+  if (!ok) {
+    ok = WiFi.softAP(DEFAULT_SSID, DEFAULT_PASS, 1, 0, MAX_AP_CLIENTS);
+    if (!ok) {
+      ok = WiFi.softAP(DEFAULT_SSID, DEFAULT_PASS);
+    }
+    if (ok) {
+      Config nc = gConfig;
+      copyStr(nc.ssid, sizeof(nc.ssid), DEFAULT_SSID);
+      copyStr(nc.password, sizeof(nc.password), DEFAULT_PASS);
+      nc.channel = 1;
+      nc.hidden = 0;
+      bool changed = false;
+      if (!saveConfigIfChanged(nc, changed)) {
+        gConfig = nc;
+      }
+    }
+  }
+
+  dnsServer.start(53, "*", WiFi.softAPIP());
+}
+
+static void factoryResetNow() {
+  digitalWrite(PIN_RELAY, gConfig.relayActiveLow ? HIGH : LOW);
+  WiFi.softAPdisconnect(true);
+
+  Preferences p;
+  if (p.begin(CONFIG_NS, false)) {
+    p.clear();
+    p.end();
+  }
+
+  ESP.restart();
+}
+
+static void scheduleWifiApply() {
+  wifiApplyPending = true;
+  wifiApplyAtUs = nowUs() + WIFI_APPLY_DELAY_US;
+}
+
+static void scheduleRestart() {
+  restartPending = true;
+  restartAtUs = nowUs() + RESTART_DELAY_US;
+  factoryResetPending = false;
+  wifiApplyPending = false;
+}
+
+static void scheduleFactoryReset() {
+  factoryResetPending = true;
+  factoryResetAtUs = nowUs() + FACTORY_RESET_DELAY_US;
+  restartPending = false;
+  wifiApplyPending = false;
+}
+
+static void updatePendingActions(uint64_t now) {
+  if (factoryResetPending) {
+    if (now >= factoryResetAtUs) {
+      factoryResetPending = false;
+      factoryResetNow();
       return;
     }
   }
 
-  if (pass.length() < 8 || pass.length() > 63) {
-    g_server.send(400, "application/json", "{\"ok\":false,\"err\":\"passlen\"}");
-    return;
-  }
-  for (size_t i = 0; i < pass.length(); i++) {
-    if (pass[i] < 0x20 || pass[i] > 0x7E) {
-      g_server.send(400, "application/json", "{\"ok\":false,\"err\":\"passchar\"}");
+  if (restartPending) {
+    if (now >= restartAtUs) {
+      restartPending = false;
+      ESP.restart();
       return;
     }
   }
 
-  Config c = g_cfg;
-  memset(c.apSsid, 0, sizeof(c.apSsid));
-  memset(c.apPass, 0, sizeof(c.apPass));
-  strncpy(c.apSsid, ssid.c_str(), sizeof(c.apSsid) - 1);
-  strncpy(c.apPass, pass.c_str(), sizeof(c.apPass) - 1);
-  cfg_finalize(c);
-  bool saved = cfg_saveIfChanged(c);
-  if (saved) g_cfg = c;
-  g_server.sendHeader("Connection", "close");
-  g_server.send(saved ? 200 : 500, "application/json",
-                saved ? "{\"ok\":true}" : "{\"ok\":false,\"err\":\"nvs\"}");
-  g_server.client().flush();
-  if (saved) g_apRestartAt = millis() + 500;
+  if (wifiApplyPending) {
+    if (now >= wifiApplyAtUs) {
+      wifiApplyPending = false;
+      applyAPSettings();
+    }
+  }
 }
 
-static void handleFactory() {
-  bool ok = g_prefs.begin(NVS_NS, false);
-  if (ok) ok = g_prefs.clear();
-  g_prefs.end();
-  g_server.sendHeader("Connection", "close");
-  g_server.send(ok ? 200 : 500, "application/json",
-                ok ? "{\"ok\":true}" : "{\"ok\":false,\"err\":\"nvs\"}");
-  g_server.client().flush();
-  if (ok) {
-    alarm_apply(false);
-    g_rebootAt = millis() + 400;
+static void updateBootButton(uint64_t now) {
+  bool pressed = (digitalRead(PIN_BOOT) == LOW);
+
+  if (pressed && !bootButtonPressed) {
+    bootButtonPressed = true;
+    bootResetTriggered = false;
+    bootButtonStartUs = now;
+  } else if (!pressed && bootButtonPressed) {
+    bootButtonPressed = false;
+    bootResetTriggered = false;
+    bootButtonStartUs = 0;
   }
+
+  if (pressed && bootButtonPressed && !bootResetTriggered && bootButtonStartUs != 0) {
+    if ((now - bootButtonStartUs) >= FACTORY_HOLD_US) {
+      bootResetTriggered = true;
+      factoryResetNow();
+    }
+  }
+}
+
+static bool parseUnsigned(const char* s, uint64_t minV, uint64_t maxV, uint64_t& out) {
+  if (!s || !*s || *s == '-') {
+    return false;
+  }
+  char* end = nullptr;
+  unsigned long long v = strtoull(s, &end, 10);
+  if (end == s || *end != '\0') {
+    return false;
+  }
+  if ((uint64_t)v < minV || (uint64_t)v > maxV) {
+    return false;
+  }
+  out = (uint64_t)v;
+  return true;
+}
+
+static bool parseDecimalCenti(const char* s, int64_t minCenti, int64_t maxCenti, int64_t& outCenti) {
+  if (!s || !*s) {
+    return false;
+  }
+  char* end = nullptr;
+  double v = strtod(s, &end);
+  if (end == s || *end != '\0' || !isfinite(v)) {
+    return false;
+  }
+  double c = v * 100.0;
+  if (c < (double)minCenti - 0.5 || c > (double)maxCenti + 0.5) {
+    return false;
+  }
+  long long ci = llround(c);
+  if (ci < minCenti || ci > maxCenti) {
+    return false;
+  }
+  outCenti = (int64_t)ci;
+  return true;
+}
+
+static bool parseBoolArg(const char* s, bool& out) {
+  if (!s || !*s) {
+    return false;
+  }
+  if (!strcmp(s, "1") || !strcmp(s, "true") || !strcmp(s, "on") || !strcmp(s, "yes")) {
+    out = true;
+    return true;
+  }
+  if (!strcmp(s, "0") || !strcmp(s, "false") || !strcmp(s, "off") || !strcmp(s, "no")) {
+    out = false;
+    return true;
+  }
+  return false;
+}
+
+static void sendJsonError(int code, const char* msg) {
+  char buf[192];
+  snprintf(buf, sizeof(buf), "{\"ok\":false,\"error\":\"%s\"}", msg);
+  server.send(code, "application/json", buf);
+}
+
+static const char INDEX_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<title>ESP32 SHT31</title>
+<style>
+:root{--bg:#080d16;--panel:#111a29;--panel2:#0b1422;--text:#e7eefc;--muted:#93a4c3;--line:#263650;--accent:#4cc9f0;--accent2:#7c5cff;--good:#39d98a;--warn:#ffb020;--bad:#ff5c7a;--shadow:0 18px 50px rgba(0,0,0,.35)}
+*{box-sizing:border-box}
+html,body{min-height:100%}
+body{margin:0;background:radial-gradient(circle at 15% 0%,rgba(76,201,240,.16),transparent 28%),radial-gradient(circle at 90% 10%,rgba(124,92,255,.14),transparent 25%),var(--bg);color:var(--text);font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+.app{max-width:1180px;margin:0 auto;padding:18px}
+.topbar{display:flex;align-items:center;gap:14px;flex-wrap:wrap;justify-content:space-between;padding:14px 0}
+.brand{font-weight:900;letter-spacing:.04em;font-size:1.12rem}
+.brand span{color:var(--accent)}
+.tabs{display:flex;gap:6px;padding:5px;background:rgba(17,26,41,.82);border:1px solid var(--line);border-radius:14px;backdrop-filter:blur(10px)}
+.tab{border:0;border-radius:10px;padding:10px 14px;background:transparent;color:var(--muted);font-weight:800;cursor:pointer;white-space:nowrap}
+.tab.active{background:linear-gradient(135deg,rgba(76,201,240,.2),rgba(124,92,255,.22));color:var(--text);box-shadow:inset 0 0 0 1px rgba(76,201,240,.2)}
+.badge{padding:8px 12px;border-radius:999px;font-size:.78rem;font-weight:800;letter-spacing:.04em;border:1px solid var(--line);background:#0b1422;color:var(--muted)}
+.badge.online{color:var(--good);border-color:rgba(57,217,138,.45);background:rgba(57,217,138,.09)}
+.badge.offline{color:var(--bad);border-color:rgba(255,92,122,.45);background:rgba(255,92,122,.09)}
+main{margin-top:18px}
+.tab-panel.hidden{display:none}
+.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:14px}
+.card{background:linear-gradient(180deg,rgba(17,26,41,.97),rgba(11,20,34,.97));border:1px solid var(--line);border-radius:18px;padding:16px;box-shadow:var(--shadow)}
+.span-3{grid-column:span 3}
+.span-4{grid-column:span 4}
+.span-6{grid-column:span 6}
+.span-12{grid-column:span 12}
+.card h3{margin:0 0 10px;color:var(--muted);font-size:.76rem;text-transform:uppercase;letter-spacing:.14em}
+.value{font-size:2.6rem;font-weight:900;line-height:1;margin:8px 0}
+.value.on{color:var(--good)}
+.value.off{color:var(--muted)}
+.unit{font-size:1rem;color:var(--muted);font-weight:700}
+.sub{color:var(--muted);font-size:.88rem;line-height:1.45}
+.mini{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px}
+.mini>div{background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.05);border-radius:12px;padding:10px;min-width:0}
+.label{font-size:.7rem;color:var(--muted);text-transform:uppercase;letter-spacing:.1em;margin-bottom:4px}
+.status-strip{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px}
+.chip{background:#0b1422;border:1px solid var(--line);border-radius:999px;padding:8px 12px;color:var(--muted);font-size:.82rem}
+.chip b{color:var(--text)}
+.form-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
+label{display:flex;flex-direction:column;gap:7px;color:var(--muted);font-size:.82rem;font-weight:700}
+input,select{width:100%;padding:12px;border-radius:12px;border:1px solid var(--line);background:#0b1422;color:var(--text);outline:none;font-size:1rem}
+input:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(76,201,240,.14)}
+input[type=checkbox]{width:auto;accent-color:var(--accent);transform:scale(1.2)}
+.switch{flex-direction:row;align-items:center;gap:10px;background:#0b1422;border:1px solid var(--line);border-radius:12px;padding:12px;color:var(--text)}
+.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:16px}
+button{border:0;border-radius:12px;padding:12px 18px;background:linear-gradient(135deg,var(--accent),var(--accent2));color:#04101a;font-weight:900;cursor:pointer;transition:transform .15s,opacity .15s}
+button:hover{transform:translateY(-1px)}
+button:disabled{opacity:.55;cursor:wait;transform:none}
+button.secondary{background:#1a2940;color:var(--text);border:1px solid var(--line)}
+button.danger{background:linear-gradient(135deg,#ff5c7a,#ff8a4c);color:#1a0610}
+.hint{color:var(--muted);font-size:.86rem;line-height:1.55}
+.toast{position:fixed;left:50%;bottom:22px;transform:translate(-50%,20px);background:#17263d;color:var(--text);border:1px solid var(--line);padding:13px 17px;border-radius:14px;box-shadow:var(--shadow);opacity:0;pointer-events:none;transition:.25s;z-index:50;max-width:min(92vw,520px)}
+.toast.show{opacity:1;transform:translate(-50%,0)}
+.toast.error{border-color:rgba(255,92,122,.65)}
+footer{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;color:var(--muted);font-size:.8rem;padding:22px 4px 4px}
+@media(max-width:900px){.span-3,.span-4,.span-6{grid-column:span 6}.form-grid{grid-template-columns:1fr}.mini{grid-template-columns:1fr}.value{font-size:2.3rem}}
+@media(max-width:620px){.app{padding:12px}.topbar{align-items:flex-start}.tabs{width:100%;overflow:auto}.tab{flex:1;min-width:112px}.span-3,.span-4,.span-6{grid-column:span 12}.value{font-size:2.15rem}footer{flex-direction:column}}
+</style>
+</head>
+<body>
+<div class="app">
+<header class="topbar">
+<div class="brand">ESP32 <span>SHT31</span></div>
+<nav class="tabs" aria-label="Navigation">
+<button class="tab active" data-tab="dashboard" type="button">Dashboard</button>
+<button class="tab" data-tab="settings" type="button">Sensor &amp; Relay</button>
+<button class="tab" data-tab="wifi" type="button">Wi-Fi AP</button>
+</nav>
+<div id="onlineBadge" class="badge offline">Offline</div>
+</header>
+<main>
+<section id="tab-dashboard" class="tab-panel">
+<div class="status-strip">
+<div class="chip">Sensor <b id="dashSensorChip">--</b></div>
+<div class="chip">Relay <b id="dashRelayChip">--</b></div>
+<div class="chip">AP <b id="dashSsidChip">--</b></div>
+</div>
+<div class="grid">
+<div class="card span-3"><h3>Temperature</h3><div class="value"><span id="dashTemp">--</span><span class="unit"> °C</span></div><div class="sub" id="dashTempSub">Waiting</div></div>
+<div class="card span-3"><h3>Humidity</h3><div class="value"><span id="dashHum">--</span><span class="unit"> %RH</span></div><div class="sub" id="dashHumSub">Waiting</div></div>
+<div class="card span-3"><h3>Relay GPIO25</h3><div id="dashRelay" class="value off">OFF</div><div class="sub" id="dashRelaySub">Waiting</div></div>
+<div class="card span-3"><h3>Sensor State</h3><div id="dashSensor" class="value off">--</div><div class="sub" id="dashSensorSub">Waiting</div></div>
+<div class="card span-6"><h3>Access Point</h3><div class="mini"><div><div class="label">SSID</div><div id="dashSsid">--</div></div><div><div class="label">IP</div><div id="dashIp">--</div></div><div><div class="label">Clients</div><div id="dashClients">--</div></div><div><div class="label">Password</div><div id="dashPasswordSet">--</div></div></div></div>
+<div class="card span-6"><h3>System</h3><div class="mini"><div><div class="label">Uptime</div><div id="dashUptime">--</div></div><div><div class="label">Free Heap</div><div id="dashHeap">--</div></div><div><div class="label">Minimum Heap</div><div id="dashMinHeap">--</div></div><div><div class="label">Sensor Errors</div><div id="dashErrors">--</div></div><div><div class="label">Last Valid Read</div><div id="dashLastRead">--</div></div><div><div class="label">Config Slot / Seq</div><div id="dashConfig">--</div></div></div></div>
+</div>
+</section>
+<section id="tab-settings" class="tab-panel hidden">
+<div class="card">
+<h3>Live Sensor</h3>
+<div class="status-strip">
+<div class="chip">Temperature <b id="setCurrentTemp">--</b></div>
+<div class="chip">Humidity <b id="setCurrentHum">--</b></div>
+<div class="chip">Relay <b id="setCurrentRelay">--</b></div>
+</div>
+<form id="settingsForm" autocomplete="off">
+<div class="form-grid">
+<label>Sample interval (seconds)<input id="sampleIntervalSec" type="number" min="1" max="600" step="0.1" required></label>
+<label>Temperature offset (°C)<input id="tempOffset" type="number" min="-10" max="10" step="0.01" required></label>
+<label>Humidity offset (%RH)<input id="humOffset" type="number" min="-20" max="20" step="0.01" required></label>
+<label>Relay minimum switch interval (ms)<input id="relayMinSwitchMs" type="number" min="0" max="600000" step="1" required></label>
+<label>Relay source<select id="relaySource"><option value="0">Temperature</option><option value="1">Humidity</option></select></label>
+<label>Trigger condition<select id="relayComparator"><option value="0">Value ≥ threshold</option><option value="1">Value ≤ threshold</option></select></label>
+<label>Threshold <span id="thresholdUnit">(°C)</span><input id="relayThreshold" type="number" step="0.01" required></label>
+<label>Hysteresis <span id="hysteresisUnit">(°C)</span><input id="relayHysteresis" type="number" min="0" max="50" step="0.01" required></label>
+<label>Manual override<select id="relayManual"><option value="0">Automatic</option><option value="1">Force off</option><option value="2">Force on</option></select></label>
+<label>Fail-safe on sensor error<select id="relayFailSafe"><option value="0">Relay off</option><option value="1">Relay on</option></select></label>
+<label class="switch"><input id="relayEnabled" type="checkbox"> Relay enabled</label>
+<label class="switch"><input id="relayActiveLow" type="checkbox"> Relay active low</label>
+</div>
+<div class="actions">
+<button type="submit">Save settings</button>
+<button type="button" id="reloadSettings" class="secondary">Reload current</button>
+</div>
+</form>
+</div>
+</section>
+<section id="tab-wifi" class="tab-panel hidden">
+<div class="card">
+<h3>Current Access Point</h3>
+<div class="status-strip">
+<div class="chip">SSID <b id="wifiCurrentSsid">--</b></div>
+<div class="chip">IP <b id="wifiCurrentIp">--</b></div>
+<div class="chip">Clients <b id="wifiCurrentClients">--</b></div>
+<div class="chip">Password <b id="wifiCurrentPasswordSet">--</b></div>
+</div>
+<form id="wifiForm" autocomplete="off">
+<div class="form-grid">
+<label>SSID<input id="wifiSsid" type="text" maxlength="32" required></label>
+<label>Password<input id="wifiPassword" type="password" minlength="8" maxlength="63" placeholder="Leave blank to keep current"></label>
+<label>Channel<input id="wifiChannel" type="number" min="1" max="13" step="1" required></label>
+<label class="switch"><input id="wifiHidden" type="checkbox"> Hidden SSID</label>
+</div>
+<div class="actions"><button type="submit">Save Wi-Fi AP</button></div>
+</form>
+<p class="hint">Saving restarts the access point. If the SSID changes, reconnect to the new SSID. The captive portal redirects all HTTP requests to http://192.168.4.1/.</p>
+<div class="actions">
+<button type="button" id="restartBtn" class="secondary">Restart ESP32</button>
+<button type="button" id="factoryBtn" class="danger">Factory reset</button>
+</div>
+</div>
+</section>
+</main>
+<footer><span id="lastUpdate">Waiting for data</span><span>Captive portal: 192.168.4.1</span></footer>
+</div>
+<div id="toast" class="toast"></div>
+<script>
+const $=id=>document.getElementById(id);
+const paths={dashboard:'/',settings:'/settings',wifi:'/wifi'};
+let activeTab='dashboard';
+let statusData=null;
+let statusBusy=false;
+let settingsDirty=false;
+let wifiDirty=false;
+let toastTimer=null;
+let wasOnline=null;
+
+function tabFromPath(path){
+  if(path.startsWith('/settings'))return 'settings';
+  if(path.startsWith('/wifi'))return 'wifi';
+  return 'dashboard';
+}
+
+function showTab(tab,push){
+  if(!paths[tab])tab='dashboard';
+  activeTab=tab;
+  document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active',b.dataset.tab===tab));
+  document.querySelectorAll('.tab-panel').forEach(p=>p.classList.toggle('hidden',p.id!=='tab-'+tab));
+  if(push&&location.pathname!==paths[tab]){
+    history.pushState({tab},'',paths[tab]);
+  }
+  if(statusData){
+    if(tab==='settings'&&!settingsDirty)fillSettings(statusData);
+    if(tab==='wifi'&&!wifiDirty)fillWifi(statusData);
+  }
+}
+
+function setOnline(online){
+  const b=$('onlineBadge');
+  b.textContent=online?'Online':'Offline';
+  b.className='badge '+(online?'online':'offline');
+  if(wasOnline===true&&!online)toast('Connection lost',true);
+  wasOnline=online;
+}
+
+function toast(msg,isError){
+  const el=$('toast');
+  el.textContent=msg;
+  el.className='toast show'+(isError?' error':'');
+  clearTimeout(toastTimer);
+  toastTimer=setTimeout(()=>{el.className='toast';},3200);
+}
+
+function formatDuration(ms){
+  ms=Number(ms)||0;
+  let s=Math.floor(ms/1000);
+  const d=Math.floor(s/86400);s%=86400;
+  const h=Math.floor(s/3600);s%=3600;
+  const m=Math.floor(s/60);s%=60;
+  if(d>0)return d+'d '+h+'h '+m+'m';
+  if(h>0)return h+'h '+m+'m '+s+'s';
+  if(m>0)return m+'m '+s+'s';
+  return s+'s';
+}
+
+function formatAge(ms){
+  ms=Number(ms)||0;
+  if(ms<1000)return '<1s';
+  if(ms<60000)return Math.floor(ms/1000)+'s';
+  if(ms<3600000)return Math.floor(ms/60000)+'m';
+  return Math.floor(ms/3600000)+'h';
+}
+
+function formatBytes(b){
+  b=Number(b)||0;
+  const kb=b/1024;
+  if(kb<1024)return kb.toFixed(1)+' KB';
+  return (kb/1024).toFixed(2)+' MB';
+}
+
+function sourceName(v){return Number(v)===1?'Humidity':'Temperature';}
+function unitForSource(v){return Number(v)===1?'%RH':'°C';}
+function comparatorName(v){return Number(v)===1?'≤':'≥';}
+function manualName(v){return Number(v)===1?'Force off':Number(v)===2?'Force on':'Automatic';}
+
+async function apiPost(path,data){
+  const body=new URLSearchParams(data||{}).toString();
+  const r=await fetch(path,{
+    method:'POST',
+    headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8'},
+    body,
+    cache:'no-store'
+  });
+  let j;
+  try{
+    j=await r.json();
+  }catch(e){
+    throw new Error('Invalid response');
+  }
+  if(!r.ok||!j.ok)throw new Error(j.error||('HTTP '+r.status));
+  return j;
+}
+
+async function refreshStatus(){
+  if(statusBusy)return;
+  statusBusy=true;
+  try{
+    const r=await fetch('/api/status',{cache:'no-store'});
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    const d=await r.json();
+    statusData=d;
+    renderStatus(d);
+    if(activeTab==='settings'&&!settingsDirty)fillSettings(d);
+    if(activeTab==='wifi'&&!wifiDirty)fillWifi(d);
+    setOnline(true);
+    $('lastUpdate').textContent='Updated '+new Date().toLocaleTimeString();
+  }catch(e){
+    setOnline(false);
+  }finally{
+    statusBusy=false;
+  }
+}
+
+function renderStatus(d){
+  const valid=!!d.sensor.valid;
+  const fresh=!!d.sensor.fresh;
+  const relay=d.relay.on;
+  const src=d.relay.source;
+  const unit=unitForSource(src);
+
+  $('dashTemp').textContent=valid?Number(d.sensor.tempC).toFixed(2):'--';
+  $('dashHum').textContent=valid?Number(d.sensor.hum).toFixed(2):'--';
+  $('dashTempSub').textContent=valid?(fresh?'Fresh reading':'Stale reading'):'No valid reading';
+  $('dashHumSub').textContent=valid?(fresh?'Fresh reading':'Stale reading'):'No valid reading';
+
+  $('dashRelay').textContent=relay?'ON':'OFF';
+  $('dashRelay').className='value '+(relay?'on':'off');
+  $('dashRelaySub').textContent=sourceName(src)+' '+comparatorName(d.relay.comparator)+' '+Number(d.relay.threshold).toFixed(2)+' '+unit+' · hysteresis '+Number(d.relay.hysteresis).toFixed(2)+' '+unit+' · '+manualName(d.relay.manual);
+
+  $('dashSensor').textContent=d.sensor.ok?'OK':'ERROR';
+  $('dashSensor').className='value '+(d.sensor.ok?'on':'off');
+  $('dashSensorSub').textContent='Address 0x'+Number(d.sensor.addr).toString(16).toUpperCase()+' · errors '+d.sensor.errors+' · reads '+d.sensor.reads;
+
+  $('dashSensorChip').textContent=d.sensor.ok?'OK':'ERROR';
+  $('dashRelayChip').textContent=relay?'ON':'OFF';
+  $('dashSsidChip').textContent=d.wifi.ssid;
+
+  $('dashSsid').textContent=d.wifi.ssid;
+  $('dashIp').textContent=d.wifi.ip;
+  $('dashClients').textContent=d.wifi.clients;
+  $('dashPasswordSet').textContent=d.wifi.passwordSet?'Set':'Open';
+
+  $('dashUptime').textContent=formatDuration(d.uptimeMs);
+  $('dashHeap').textContent=formatBytes(d.system.freeHeap);
+  $('dashMinHeap').textContent=formatBytes(d.system.minFreeHeap);
+  $('dashErrors').textContent=d.sensor.errors;
+  $('dashLastRead').textContent=valid?formatAge(d.sensor.lastReadAgeMs)+' ago':'--';
+  $('dashConfig').textContent='#'+d.system.configSlot+' / '+d.system.configSeq;
+
+  $('setCurrentTemp').textContent=valid?Number(d.sensor.tempC).toFixed(2)+' °C':'--';
+  $('setCurrentHum').textContent=valid?Number(d.sensor.hum).toFixed(2)+' %RH':'--';
+  $('setCurrentRelay').textContent=relay?'ON':'OFF';
+
+  $('wifiCurrentSsid').textContent=d.wifi.ssid;
+  $('wifiCurrentIp').textContent=d.wifi.ip;
+  $('wifiCurrentClients').textContent=d.wifi.clients;
+  $('wifiCurrentPasswordSet').textContent=d.wifi.passwordSet?'Set':'Open';
+}
+
+function updateUnits(){
+  const src=$('relaySource').value;
+  const unit=unitForSource(src);
+  $('thresholdUnit').textContent='('+unit+')';
+  $('hysteresisUnit').textContent='('+unit+')';
+  const t=$('relayThreshold');
+  if(src==='1'){
+    t.min='0';
+    t.max='100';
+  }else{
+    t.min='-100';
+    t.max='200';
+  }
+}
+
+function fillSettings(d){
+  const c=d.config;
+  $('sampleIntervalSec').value=(Number(c.sampleIntervalMs)/1000).toFixed(1);
+  $('tempOffset').value=Number(c.tempOffset).toFixed(2);
+  $('humOffset').value=Number(c.humOffset).toFixed(2);
+  $('relayMinSwitchMs').value=String(c.relayMinSwitchMs);
+  $('relaySource').value=String(c.relaySource);
+  $('relayComparator').value=String(c.relayComparator);
+  $('relayThreshold').value=Number(c.relayThreshold).toFixed(2);
+  $('relayHysteresis').value=Number(c.relayHysteresis).toFixed(2);
+  $('relayManual').value=String(c.relayManual);
+  $('relayFailSafe').value=c.relayFailSafe?'1':'0';
+  $('relayEnabled').checked=!!c.relayEnabled;
+  $('relayActiveLow').checked=!!c.relayActiveLow;
+  updateUnits();
+}
+
+function fillWifi(d){
+  if(!wifiDirty){
+    $('wifiSsid').value=d.wifi.ssid;
+    $('wifiPassword').value='';
+    $('wifiChannel').value=String(d.wifi.channel);
+    $('wifiHidden').checked=!!d.wifi.hidden;
+  }
+  $('wifiCurrentSsid').textContent=d.wifi.ssid;
+  $('wifiCurrentIp').textContent=d.wifi.ip;
+  $('wifiCurrentClients').textContent=d.wifi.clients;
+  $('wifiCurrentPasswordSet').textContent=d.wifi.passwordSet?'Set':'Open';
+}
+
+document.querySelectorAll('.tab').forEach(b=>{
+  b.addEventListener('click',()=>showTab(b.dataset.tab,true));
+});
+
+window.addEventListener('popstate',()=>showTab(tabFromPath(location.pathname),false));
+
+['input','change'].forEach(ev=>{
+  $('settingsForm').addEventListener(ev,()=>{settingsDirty=true;});
+});
+
+['input','change'].forEach(ev=>{
+  $('wifiForm').addEventListener(ev,()=>{wifiDirty=true;});
+});
+
+$('relaySource').addEventListener('change',()=>{
+  updateUnits();
+  settingsDirty=true;
+});
+
+$('settingsForm').addEventListener('submit',async e=>{
+  e.preventDefault();
+  const form=e.target;
+  if(!form.reportValidity())return;
+  const btn=form.querySelector('button[type="submit"]');
+  btn.disabled=true;
+  try{
+    const data={
+      sampleIntervalMs:String(Math.round(parseFloat($('sampleIntervalSec').value)*1000)),
+      tempOffset:$('tempOffset').value,
+      humOffset:$('humOffset').value,
+      relayEnabled:$('relayEnabled').checked?'1':'0',
+      relaySource:$('relaySource').value,
+      relayComparator:$('relayComparator').value,
+      relayThreshold:$('relayThreshold').value,
+      relayHysteresis:$('relayHysteresis').value,
+      relayMinSwitchMs:$('relayMinSwitchMs').value,
+      relayManual:$('relayManual').value,
+      relayFailSafe:$('relayFailSafe').value,
+      relayActiveLow:$('relayActiveLow').checked?'1':'0'
+    };
+    const j=await apiPost('/api/settings',data);
+    settingsDirty=false;
+    toast(j.changed?'Settings saved':'No changes');
+    await refreshStatus();
+  }catch(err){
+    toast(err.message,true);
+  }finally{
+    btn.disabled=false;
+  }
+});
+
+$('reloadSettings').addEventListener('click',async()=>{
+  settingsDirty=false;
+  if(statusData)fillSettings(statusData);
+  await refreshStatus();
+});
+
+$('wifiForm').addEventListener('submit',async e=>{
+  e.preventDefault();
+  const form=e.target;
+  if(!form.reportValidity())return;
+  const btn=form.querySelector('button[type="submit"]');
+  btn.disabled=true;
+  try{
+    const data={
+      ssid:$('wifiSsid').value,
+      password:$('wifiPassword').value,
+      channel:$('wifiChannel').value,
+      hidden:$('wifiHidden').checked?'1':'0'
+    };
+    const j=await apiPost('/api/wifi',data);
+    wifiDirty=false;
+    $('wifiPassword').value='';
+    toast(j.changed?'Wi-Fi settings saved. Access point restarting...':'No changes');
+    setTimeout(()=>refreshStatus(),2500);
+  }catch(err){
+    toast(err.message,true);
+  }finally{
+    btn.disabled=false;
+  }
+});
+
+$('restartBtn').addEventListener('click',async()=>{
+  if(!confirm('Restart ESP32?'))return;
+  $('restartBtn').disabled=true;
+  try{
+    await apiPost('/api/restart',{});
+    toast('Restart scheduled');
+  }catch(err){
+    toast(err.message,true);
+  }finally{
+    setTimeout(()=>{$('restartBtn').disabled=false;},3000);
+  }
+});
+
+$('factoryBtn').addEventListener('click',async()=>{
+  if(!confirm('Factory reset will erase all settings and restart. Continue?'))return;
+  $('factoryBtn').disabled=true;
+  try{
+    await apiPost('/api/factory-reset',{});
+    toast('Factory reset scheduled');
+  }catch(err){
+    toast(err.message,true);
+  }finally{
+    setTimeout(()=>{$('factoryBtn').disabled=false;},3000);
+  }
+});
+
+document.addEventListener('visibilitychange',()=>{
+  if(!document.hidden)refreshStatus();
+});
+
+showTab(tabFromPath(location.pathname),false);
+refreshStatus();
+setInterval(()=>{
+  if(!document.hidden)refreshStatus();
+},2000);
+</script>
+</body>
+</html>
+)rawliteral";
+
+static void handleRoot() {
+  server.sendHeader("Cache-Control", "no-store");
+  server.sendHeader("X-Content-Type-Options", "nosniff");
+  server.send_P(200, "text/html", INDEX_HTML);
 }
 
 static void handleCaptive() {
-  g_server.sendHeader("Location", String("http://") + WiFi.softAPIP().toString() + "/", true);
-  g_server.send(302, "text/plain", "");
+  server.sendHeader("Location", "http://192.168.4.1/");
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(302, "text/plain", "");
+}
+
+static void handleNotFound() {
+  if (server.uri().startsWith("/api/")) {
+    sendJsonError(404, "Not found");
+    return;
+  }
+  handleCaptive();
+}
+
+static void handleStatus() {
+  uint64_t now = nowUs();
+  bool fresh = sensorDataFresh(now);
+
+  char ssidEsc[96];
+  jsonEscape(ssidEsc, sizeof(ssidEsc), gConfig.ssid);
+
+  IPAddress ip = WiFi.softAPIP();
+  char ipStr[16];
+  snprintf(ipStr, sizeof(ipStr), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
+
+  char buf[2048];
+  int n = snprintf(
+    buf,
+    sizeof(buf),
+    "{\"ok\":true,\"uptimeMs\":%llu,"
+    "\"sensor\":{\"ok\":%s,\"valid\":%s,\"fresh\":%s,\"tempC\":%.2f,\"hum\":%.2f,\"lastReadAgeMs\":%llu,\"errors\":%llu,\"reads\":%llu,\"addr\":%u},"
+    "\"relay\":{\"on\":%s,\"physical\":%u,\"enabled\":%s,\"source\":%u,\"comparator\":%u,\"threshold\":%.2f,\"hysteresis\":%.2f,\"activeLow\":%s,\"manual\":%u,\"failSafe\":%s,\"minSwitchMs\":%llu},"
+    "\"wifi\":{\"ssid\":\"%s\",\"ip\":\"%s\",\"clients\":%u,\"channel\":%u,\"hidden\":%s,\"passwordSet\":%s},"
+    "\"config\":{\"sampleIntervalMs\":%llu,\"tempOffset\":%.2f,\"humOffset\":%.2f,\"relayThreshold\":%.2f,\"relayHysteresis\":%.2f,\"relaySource\":%u,\"relayComparator\":%u,\"relayEnabled\":%s,\"relayActiveLow\":%s,\"relayManual\":%u,\"relayFailSafe\":%s,\"relayMinSwitchMs\":%llu},"
+    "\"system\":{\"freeHeap\":%lu,\"minFreeHeap\":%lu,\"maxAllocHeap\":%lu,\"configSeq\":%llu,\"configSlot\":%u}}",
+    (unsigned long long)(now / 1000ULL),
+    sensorOk ? "true" : "false",
+    (lastValidSensorUs != 0) ? "true" : "false",
+    fresh ? "true" : "false",
+    (double)tempCenti / 100.0,
+    (double)humCenti / 100.0,
+    (unsigned long long)(lastSensorReadUs == 0 ? 0 : (now - lastSensorReadUs) / 1000ULL),
+    (unsigned long long)sensorErrorCount,
+    (unsigned long long)sensorReadCount,
+    (unsigned)sensorAddr,
+    relayOn ? "true" : "false",
+    (unsigned)relayPhysical,
+    gConfig.relayEnabled ? "true" : "false",
+    (unsigned)gConfig.relaySource,
+    (unsigned)gConfig.relayComparator,
+    (double)gConfig.relayThresholdCenti / 100.0,
+    (double)gConfig.relayHysteresisCenti / 100.0,
+    gConfig.relayActiveLow ? "true" : "false",
+    (unsigned)gConfig.relayManual,
+    gConfig.relayFailSafe ? "true" : "false",
+    (unsigned long long)gConfig.relayMinSwitchMs,
+    ssidEsc,
+    ipStr,
+    (unsigned)WiFi.softAPgetStationNum(),
+    (unsigned)gConfig.channel,
+    gConfig.hidden ? "true" : "false",
+    (boundedStrLen(gConfig.password, sizeof(gConfig.password)) > 0) ? "true" : "false",
+    (unsigned long long)gConfig.sampleIntervalMs,
+    (double)gConfig.tempOffsetCenti / 100.0,
+    (double)gConfig.humOffsetCenti / 100.0,
+    (double)gConfig.relayThresholdCenti / 100.0,
+    (double)gConfig.relayHysteresisCenti / 100.0,
+    (unsigned)gConfig.relaySource,
+    (unsigned)gConfig.relayComparator,
+    gConfig.relayEnabled ? "true" : "false",
+    gConfig.relayActiveLow ? "true" : "false",
+    (unsigned)gConfig.relayManual,
+    gConfig.relayFailSafe ? "true" : "false",
+    (unsigned long long)gConfig.relayMinSwitchMs,
+    (unsigned long)ESP.getFreeHeap(),
+    (unsigned long)ESP.getMinFreeHeap(),
+    (unsigned long)ESP.getMaxAllocHeap(),
+    (unsigned long long)gConfigSeq,
+    (unsigned)gActiveSlot
+  );
+
+  if (n < 0 || n >= (int)sizeof(buf)) {
+    sendJsonError(500, "Status build failed");
+    return;
+  }
+
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", buf);
+}
+
+static void handleSettingsSave() {
+  if (server.method() != HTTP_POST) {
+    sendJsonError(405, "Method not allowed");
+    return;
+  }
+
+  uint64_t sampleIntervalMs;
+  uint64_t minSwitchMs;
+  uint64_t source;
+  uint64_t comparator;
+  uint64_t manual;
+  bool enabled;
+  bool activeLow;
+  bool failSafe;
+  int64_t tempOff;
+  int64_t humOff;
+  int64_t threshold;
+  int64_t hysteresis;
+
+  if (!parseUnsigned(server.arg("sampleIntervalMs").c_str(), 1000ULL, 600000ULL, sampleIntervalMs)) {
+    sendJsonError(400, "Invalid sampleIntervalMs");
+    return;
+  }
+  if (!parseDecimalCenti(server.arg("tempOffset").c_str(), -1000LL, 1000LL, tempOff)) {
+    sendJsonError(400, "Invalid tempOffset");
+    return;
+  }
+  if (!parseDecimalCenti(server.arg("humOffset").c_str(), -2000LL, 2000LL, humOff)) {
+    sendJsonError(400, "Invalid humOffset");
+    return;
+  }
+  if (!parseBoolArg(server.arg("relayEnabled").c_str(), enabled)) {
+    sendJsonError(400, "Invalid relayEnabled");
+    return;
+  }
+  if (!parseUnsigned(server.arg("relaySource").c_str(), 0ULL, 1ULL, source)) {
+    sendJsonError(400, "Invalid relaySource");
+    return;
+  }
+  if (!parseUnsigned(server.arg("relayComparator").c_str(), 0ULL, 1ULL, comparator)) {
+    sendJsonError(400, "Invalid relayComparator");
+    return;
+  }
+  if (!parseDecimalCenti(server.arg("relayThreshold").c_str(), -10000LL, 20000LL, threshold)) {
+    sendJsonError(400, "Invalid relayThreshold");
+    return;
+  }
+  if (!parseDecimalCenti(server.arg("relayHysteresis").c_str(), 0LL, 5000LL, hysteresis)) {
+    sendJsonError(400, "Invalid relayHysteresis");
+    return;
+  }
+  if (!parseUnsigned(server.arg("relayMinSwitchMs").c_str(), 0ULL, 600000ULL, minSwitchMs)) {
+    sendJsonError(400, "Invalid relayMinSwitchMs");
+    return;
+  }
+  if (!parseUnsigned(server.arg("relayManual").c_str(), 0ULL, 2ULL, manual)) {
+    sendJsonError(400, "Invalid relayManual");
+    return;
+  }
+  if (!parseBoolArg(server.arg("relayFailSafe").c_str(), failSafe)) {
+    sendJsonError(400, "Invalid relayFailSafe");
+    return;
+  }
+  if (!parseBoolArg(server.arg("relayActiveLow").c_str(), activeLow)) {
+    sendJsonError(400, "Invalid relayActiveLow");
+    return;
+  }
+
+  if (source == 0ULL) {
+    if (threshold < -10000LL || threshold > 20000LL) {
+      sendJsonError(400, "Invalid relayThreshold");
+      return;
+    }
+  } else {
+    if (threshold < 0LL || threshold > 10000LL) {
+      sendJsonError(400, "Invalid relayThreshold");
+      return;
+    }
+  }
+
+  Config nc = gConfig;
+  nc.sampleIntervalMs = sampleIntervalMs;
+  nc.tempOffsetCenti = tempOff;
+  nc.humOffsetCenti = humOff;
+  nc.relayEnabled = enabled ? 1 : 0;
+  nc.relaySource = (uint8_t)source;
+  nc.relayComparator = (uint8_t)comparator;
+  nc.relayThresholdCenti = threshold;
+  nc.relayHysteresisCenti = hysteresis;
+  nc.relayMinSwitchMs = minSwitchMs;
+  nc.relayManual = (uint8_t)manual;
+  nc.relayFailSafe = failSafe ? 1 : 0;
+  nc.relayActiveLow = activeLow ? 1 : 0;
+
+  bool changed = false;
+  if (!saveConfigIfChanged(nc, changed)) {
+    sendJsonError(500, "Save failed");
+    return;
+  }
+
+  if (changed) {
+    uint64_t now = nowUs();
+    nextSensorTriggerUs = now;
+    updateRelay(true, now);
+  }
+
+  char buf[96];
+  snprintf(buf, sizeof(buf), "{\"ok\":true,\"changed\":%s}", changed ? "true" : "false");
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", buf);
+}
+
+static bool isPrintableAscii(const String& s) {
+  for (size_t i = 0; i < s.length(); ++i) {
+    uint8_t c = (uint8_t)s.charAt(i);
+    if (c < 0x20 || c > 0x7E) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static void handleWifiSave() {
+  if (server.method() != HTTP_POST) {
+    sendJsonError(405, "Method not allowed");
+    return;
+  }
+
+  String ssidArg = server.arg("ssid");
+  if (ssidArg.length() < 1 || ssidArg.length() > 32) {
+    sendJsonError(400, "Invalid SSID");
+    return;
+  }
+  if (!isPrintableAscii(ssidArg)) {
+    sendJsonError(400, "SSID must be printable ASCII");
+    return;
+  }
+
+  String passArg = server.arg("password");
+  if (passArg.length() > 0 && (passArg.length() < 8 || passArg.length() > 63)) {
+    sendJsonError(400, "Invalid password");
+    return;
+  }
+  if (passArg.length() > 0 && !isPrintableAscii(passArg)) {
+    sendJsonError(400, "Password must be printable ASCII");
+    return;
+  }
+
+  uint64_t channel;
+  bool hidden;
+
+  if (!parseUnsigned(server.arg("channel").c_str(), 1ULL, 13ULL, channel)) {
+    sendJsonError(400, "Invalid channel");
+    return;
+  }
+  if (!parseBoolArg(server.arg("hidden").c_str(), hidden)) {
+    sendJsonError(400, "Invalid hidden");
+    return;
+  }
+
+  Config nc = gConfig;
+  copyStr(nc.ssid, sizeof(nc.ssid), ssidArg.c_str());
+  if (passArg.length() > 0) {
+    copyStr(nc.password, sizeof(nc.password), passArg.c_str());
+  }
+  nc.channel = (uint8_t)channel;
+  nc.hidden = hidden ? 1 : 0;
+
+  bool changed = false;
+  if (!saveConfigIfChanged(nc, changed)) {
+    sendJsonError(500, "Save failed");
+    return;
+  }
+
+  if (changed) {
+    scheduleWifiApply();
+  }
+
+  char buf[128];
+  snprintf(
+    buf,
+    sizeof(buf),
+    "{\"ok\":true,\"changed\":%s,\"applyScheduled\":%s}",
+    changed ? "true" : "false",
+    changed ? "true" : "false"
+  );
+
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", buf);
+}
+
+static void handleRestart() {
+  if (server.method() != HTTP_POST) {
+    sendJsonError(405, "Method not allowed");
+    return;
+  }
+  scheduleRestart();
+  server.send(200, "application/json", "{\"ok\":true,\"scheduled\":true}");
+}
+
+static void handleFactoryReset() {
+  if (server.method() != HTTP_POST) {
+    sendJsonError(405, "Method not allowed");
+    return;
+  }
+  scheduleFactoryReset();
+  server.send(200, "application/json", "{\"ok\":true,\"scheduled\":true}");
+}
+
+static void setupWebServer() {
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/status", HTTP_GET, handleRoot);
+  server.on("/settings", HTTP_GET, handleRoot);
+  server.on("/wifi", HTTP_GET, handleRoot);
+
+  server.on("/api/status", HTTP_GET, handleStatus);
+  server.on("/api/settings", HTTP_POST, handleSettingsSave);
+  server.on("/api/wifi", HTTP_POST, handleWifiSave);
+  server.on("/api/restart", HTTP_POST, handleRestart);
+  server.on("/api/factory-reset", HTTP_POST, handleFactoryReset);
+
+  server.on("/generate_204", HTTP_GET, handleCaptive);
+  server.on("/gen_204", HTTP_GET, handleCaptive);
+  server.on("/hotspot-detect.html", HTTP_GET, handleCaptive);
+  server.on("/library/test/success.html", HTTP_GET, handleCaptive);
+  server.on("/connecttest.txt", HTTP_GET, handleCaptive);
+  server.on("/redirect", HTTP_GET, handleCaptive);
+  server.on("/canonical.html", HTTP_GET, handleCaptive);
+  server.on("/success.txt", HTTP_GET, handleCaptive);
+  server.on("/ncsi.txt", HTTP_GET, handleCaptive);
+  server.on("/fwlink", HTTP_GET, handleCaptive);
+
+  server.onNotFound(handleNotFound);
+  server.begin();
 }
 
 void setup() {
-  Serial.begin(115200);
-  pinMode(RELAY_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN, LOW);
-  pinMode(ALARM_PIN, OUTPUT);
-  digitalWrite(ALARM_PIN, LOW);
-  pinMode(BOOT_BTN_PIN, INPUT_PULLUP);
+  Wire.begin(PIN_SDA, PIN_SCL);
+  Wire.setClock(100000);
 
-  Wire.begin();
+  loadConfig();
 
-  if (!cfg_loadFromNVS()) {
-    cfg_defaults(g_cfg);
-    cfg_finalize(g_cfg);
-    g_prefs.begin(NVS_NS, false);
-    g_prefs.putBytes("cfg", &g_cfg, sizeof(g_cfg));
-    g_prefs.end();
-  }
+  pinMode(PIN_RELAY, OUTPUT);
+  relayOn = false;
+  relayPhysical = 255;
+  digitalWrite(PIN_RELAY, gConfig.relayActiveLow ? HIGH : LOW);
 
-  alarm_loadNVS();
+  pinMode(PIN_BOOT, INPUT_PULLUP);
 
-  relay_apply(false);
-  alarm_apply(false);
-  if (ap_start()) g_dnsIp = WiFi.softAPIP();
+  applyAPSettings();
+  setupWebServer();
 
-  g_server.on("/", HTTP_GET, handleRoot);
-  g_server.on("/relay", HTTP_GET, handleRelayPage);
-  g_server.on("/alarm", HTTP_GET, handleAlarmPage);
-  g_server.on("/wifi", HTTP_GET, handleWifiPage);
-  g_server.on("/api/status", HTTP_GET, handleStatus);
-  g_server.on("/api/thresholds", HTTP_POST, handleThresholds);
-  g_server.on("/api/relay", HTTP_POST, handleRelayApi);
-  g_server.on("/api/alarm", HTTP_POST, handleAlarmApi);
-  g_server.on("/api/wifi", HTTP_POST, handleWifiApi);
-  g_server.on("/api/factory", HTTP_POST, handleFactory);
-  g_server.onNotFound([]() {
-    if (!g_server.hostHeader().startsWith(WiFi.softAPIP().toString())) {
-      handleCaptive();
-    } else {
-      handle404();
-    }
-  });
-  g_server.begin();
-
-  g_lastSensorRead = millis();
-  g_lastApCheck = millis();
-  g_lastDns = millis();
+  uint64_t now = nowUs();
+  nextSensorTriggerUs = now;
+  lastRelaySwitchUs = 0;
+  updateRelay(true, now);
 }
 
 void loop() {
-  uint32_t now = millis();
+  uint64_t now = nowUs();
 
-  if (g_rebootAt != 0 && (int32_t)(now - g_rebootAt) >= 0) {
-    ESP.restart();
-  }
+  updateBootButton(now);
+  updateSensor(now);
+  updateRelay(false, now);
+  updatePendingActions(now);
 
-  if ((uint32_t)(now - g_lastDns) >= DNS_INTERVAL_MS) {
-    g_lastDns = now;
-    g_dns.processNextRequest();
-  }
+  server.handleClient();
+  dnsServer.processNextRequest();
 
-  g_server.handleClient();
-
-  if ((uint32_t)(now - g_lastSensorRead) >= SENSOR_INTERVAL_MS) {
-    g_lastSensorRead = now;
-    if (!sht_start()) {
-      if (g_sensorOk || g_sensorFaultSince == 0) g_sensorFaultSince = now;
-      g_sensorOk = false;
-      relay_update();
-      alarm_update();
-    }
-  }
-
-  {
-    float t, h;
-    int r = sht_poll(t, h);
-    if (r == 1) {
-      g_tempC = t; g_humPct = h;
-      g_sensorOk = true;
-      g_sensorFaultSince = 0;
-      relay_update();
-      alarm_update();
-    } else if (r < 0) {
-      if (g_sensorOk || g_sensorFaultSince == 0) g_sensorFaultSince = now;
-      g_sensorOk = false;
-      relay_update();
-      alarm_update();
-    }
-  }
-
-  if (g_apRestartAt != 0 && (int32_t)(now - g_apRestartAt) >= 0) {
-    g_apRestartAt = 0;
-    ap_start();
-    if (g_apRunning) g_dnsIp = WiFi.softAPIP();
-    else g_dnsIp = IPAddress(0, 0, 0, 0);
-    g_apIpZeroCount = 0;
-    alarm_update();
-  }
-
-  if ((uint32_t)(now - g_lastApCheck) >= AP_CHECK_INTERVAL_MS) {
-    g_lastApCheck = now;
-    ap_ensure();
-  }
-
-  bool raw = digitalRead(BOOT_BTN_PIN);
-  if (raw != g_btnLastRaw) {
-    g_btnLastRaw = raw;
-    g_btnLastChange = now;
-  }
-
-  if (!g_btnStable && !g_btnHoldHandled && g_btnPressStart != 0) {
-    if ((uint32_t)(now - g_btnPressStart) >= FACTORY_HOLD_MS) {
-      g_btnHoldHandled = true;
-      bool ok = g_prefs.begin(NVS_NS, false);
-      if (ok) ok = g_prefs.clear();
-      g_prefs.end();
-      if (ok) {
-        alarm_apply(false);
-        ESP.restart();
-      }
-    }
-  }
-
-  if ((uint32_t)(now - g_btnLastChange) >= BTN_DEBOUNCE_MS) {
-    if (g_btnStable != raw) {
-      g_btnStable = raw;
-      if (!raw) {
-        g_btnPressStart = now;
-        g_btnHoldHandled = false;
-      } else {
-        g_btnPressStart = 0;
-      }
-    }
-  }
-
-  delay(1);
+  yield();
 }

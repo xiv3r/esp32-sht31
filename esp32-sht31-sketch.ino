@@ -124,8 +124,15 @@ static void copyStr(char* dst, size_t dstSize, const char* src) {
   dst[i] = 0;
 }
 
-template <typename T>
-static T clampValue(T v, T lo, T hi) {
+static int clampValue(int v, int lo, int hi) {
+  return v < lo ? lo : (v > hi ? hi : v);
+}
+
+static uint64_t clampValue(uint64_t v, uint64_t lo, uint64_t hi) {
+  return v < lo ? lo : (v > hi ? hi : v);
+}
+
+static int64_t clampValue(int64_t v, int64_t lo, int64_t hi) {
   return v < lo ? lo : (v > hi ? hi : v);
 }
 
@@ -252,7 +259,7 @@ static bool validateAndSanitizeConfig(Config& c) {
     }
   }
 
-  c.channel = (uint8_t)clampValue<int>((int)c.channel, 1, 13);
+  c.channel = (uint8_t)clampValue((int)c.channel, 1, 13);
   c.hidden = c.hidden ? 1 : 0;
   c.relayEnabled = c.relayEnabled ? 1 : 0;
   c.relaySource = c.relaySource > 1 ? 0 : c.relaySource;
@@ -261,16 +268,16 @@ static bool validateAndSanitizeConfig(Config& c) {
   c.relayManual = c.relayManual > 2 ? 0 : c.relayManual;
   c.relayFailSafe = c.relayFailSafe ? 1 : 0;
 
-  c.relayMinSwitchMs = clampValue<uint64_t>(c.relayMinSwitchMs, 0ULL, 600000ULL);
-  c.sampleIntervalMs = clampValue<uint64_t>(c.sampleIntervalMs, 1000ULL, 600000ULL);
-  c.tempOffsetCenti = clampValue<int64_t>(c.tempOffsetCenti, -1000LL, 1000LL);
-  c.humOffsetCenti = clampValue<int64_t>(c.humOffsetCenti, -2000LL, 2000LL);
+  c.relayMinSwitchMs = clampValue(c.relayMinSwitchMs, (uint64_t)0, (uint64_t)600000);
+  c.sampleIntervalMs = clampValue(c.sampleIntervalMs, (uint64_t)1000, (uint64_t)600000);
+  c.tempOffsetCenti = clampValue(c.tempOffsetCenti, (int64_t)-1000, (int64_t)1000);
+  c.humOffsetCenti = clampValue(c.humOffsetCenti, (int64_t)-2000, (int64_t)2000);
   if (c.relaySource == 1) {
-    c.relayThresholdCenti = clampValue<int64_t>(c.relayThresholdCenti, 0LL, 10000LL);
+    c.relayThresholdCenti = clampValue(c.relayThresholdCenti, (int64_t)0, (int64_t)10000);
   } else {
-    c.relayThresholdCenti = clampValue<int64_t>(c.relayThresholdCenti, -10000LL, 20000LL);
+    c.relayThresholdCenti = clampValue(c.relayThresholdCenti, (int64_t)-10000, (int64_t)20000);
   }
-  c.relayHysteresisCenti = clampValue<int64_t>(c.relayHysteresisCenti, 0LL, 5000LL);
+  c.relayHysteresisCenti = clampValue(c.relayHysteresisCenti, (int64_t)0, (int64_t)5000);
   c.reserved[0] = 0;
   c.reserved[1] = 0;
   return true;

@@ -33,7 +33,7 @@ jobs:
         arduino-cli core update-index
         arduino-cli core install esp32:esp32
 
-        arduino-cli lib deps "Adafruit SHT31 Library"
+        arduino-cli lib install "Adafruit SHT31 Library"
         arduino-cli lib install "Adafruit BusIO"
         arduino-cli lib install "Adafruit Unified Sensor"
         

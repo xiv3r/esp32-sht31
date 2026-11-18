@@ -284,13 +284,27 @@ static bool validateAndSanitizeConfig(Config& c) {
 }
 
 static bool configFieldsEqual(const Config& a, const Config& b) {
-  Config x = a;
-  Config y = b;
-  x.seq = 0;
-  y.seq = 0;
-  x.crc32 = 0;
-  y.crc32 = 0;
-  return memcmp(&x, &y, sizeof(Config)) == 0;
+  return a.magic == b.magic
+      && a.version == b.version
+      && a.size == b.size
+      && a.tempOffsetCenti == b.tempOffsetCenti
+      && a.humOffsetCenti == b.humOffsetCenti
+      && a.relayThresholdCenti == b.relayThresholdCenti
+      && a.relayHysteresisCenti == b.relayHysteresisCenti
+      && a.relayMinSwitchMs == b.relayMinSwitchMs
+      && a.sampleIntervalMs == b.sampleIntervalMs
+      && memcmp(a.ssid, b.ssid, sizeof(a.ssid)) == 0
+      && memcmp(a.password, b.password, sizeof(a.password)) == 0
+      && a.channel == b.channel
+      && a.hidden == b.hidden
+      && a.relayEnabled == b.relayEnabled
+      && a.relaySource == b.relaySource
+      && a.relayComparator == b.relayComparator
+      && a.relayActiveLow == b.relayActiveLow
+      && a.relayManual == b.relayManual
+      && a.relayFailSafe == b.relayFailSafe
+      && a.reserved[0] == b.reserved[0]
+      && a.reserved[1] == b.reserved[1];
 }
 
 static bool readConfigSlot(const char* key, Config& out) {
@@ -711,11 +725,18 @@ static bool parseBoolArg(const char* s, bool& out) {
   if (!s || !*s) {
     return false;
   }
-  if (!strcmp(s, "1") || !strcmp(s, "true") || !strcmp(s, "on") || !strcmp(s, "yes")) {
+  char lower[8];
+  size_t i = 0;
+  for (; s[i] != 0 && i + 1 < sizeof(lower); ++i) {
+    char c = s[i];
+    lower[i] = (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
+  }
+  lower[i] = 0;
+  if (!strcmp(lower, "1") || !strcmp(lower, "true") || !strcmp(lower, "on") || !strcmp(lower, "yes")) {
     out = true;
     return true;
   }
-  if (!strcmp(s, "0") || !strcmp(s, "false") || !strcmp(s, "off") || !strcmp(s, "no")) {
+  if (!strcmp(lower, "0") || !strcmp(lower, "false") || !strcmp(lower, "off") || !strcmp(lower, "no")) {
     out = false;
     return true;
   }
@@ -1372,12 +1393,7 @@ static void handleSettingsSave() {
     return;
   }
 
-  if (source == 0ULL) {
-    if (threshold < -10000LL || threshold > 20000LL) {
-      sendJsonError(400, "Invalid relayThreshold");
-      return;
-    }
-  } else {
+  if (source != 0ULL) {
     if (threshold < 0LL || threshold > 10000LL) {
       sendJsonError(400, "Invalid relayThreshold");
       return;
@@ -1543,13 +1559,14 @@ static void setupWebServer() {
 void setup() {
   Wire.begin(PIN_SDA, PIN_SCL);
   Wire.setClock(100000);
+  Wire.setTimeOut(20);
 
   loadConfig();
 
+  pinMode(PIN_RELAY, OUTPUT);
   digitalWrite(PIN_RELAY, gConfig.relayActiveLow ? HIGH : LOW);
   relayOn = false;
   relayPhysical = 255;
-  pinMode(PIN_RELAY, OUTPUT);
 
   pinMode(PIN_BOOT, INPUT_PULLUP);
 

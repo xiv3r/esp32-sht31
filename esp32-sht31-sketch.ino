@@ -28,6 +28,7 @@ static const char DEFAULT_PASS[] = "12345678";
 static const uint8_t MAX_AP_CLIENTS = 4;
 static const uint64_t FACTORY_HOLD_US = 5000000ULL;
 static const uint64_t SHT31_MEASUREMENT_WAIT_US = 16000ULL;
+static const uint64_t SHT31_TIMEOUT_US = 100000ULL;
 static const uint64_t SENSOR_RETRY_US = 5000000ULL;
 static const uint64_t WIFI_APPLY_DELAY_US = 1500000ULL;
 static const uint64_t RESTART_DELAY_US = 750000ULL;
@@ -124,15 +125,8 @@ static void copyStr(char* dst, size_t dstSize, const char* src) {
   dst[i] = 0;
 }
 
-static int clampValue(int v, int lo, int hi) {
-  return v < lo ? lo : (v > hi ? hi : v);
-}
-
-static uint64_t clampValue(uint64_t v, uint64_t lo, uint64_t hi) {
-  return v < lo ? lo : (v > hi ? hi : v);
-}
-
-static int64_t clampValue(int64_t v, int64_t lo, int64_t hi) {
+template <typename T>
+static T clampValue(T v, T lo, T hi) {
   return v < lo ? lo : (v > hi ? hi : v);
 }
 
@@ -245,21 +239,7 @@ static bool validateAndSanitizeConfig(Config& c) {
     return false;
   }
 
-  for (size_t i = 0; i < ssidLen; ++i) {
-    uint8_t ch = (uint8_t)c.ssid[i];
-    if (ch < 0x20 || ch > 0x7E) {
-      return false;
-    }
-  }
-
-  for (size_t i = 0; i < passLen; ++i) {
-    uint8_t ch = (uint8_t)c.password[i];
-    if (ch < 0x20 || ch > 0x7E) {
-      return false;
-    }
-  }
-
-  c.channel = (uint8_t)clampValue((int)c.channel, 1, 13);
+  c.channel = (uint8_t)clampValue<int>((int)c.channel, 1, 13);
   c.hidden = c.hidden ? 1 : 0;
   c.relayEnabled = c.relayEnabled ? 1 : 0;
   c.relaySource = c.relaySource > 1 ? 0 : c.relaySource;
@@ -268,16 +248,12 @@ static bool validateAndSanitizeConfig(Config& c) {
   c.relayManual = c.relayManual > 2 ? 0 : c.relayManual;
   c.relayFailSafe = c.relayFailSafe ? 1 : 0;
 
-  c.relayMinSwitchMs = clampValue(c.relayMinSwitchMs, (uint64_t)0, (uint64_t)600000);
-  c.sampleIntervalMs = clampValue(c.sampleIntervalMs, (uint64_t)1000, (uint64_t)600000);
-  c.tempOffsetCenti = clampValue(c.tempOffsetCenti, (int64_t)-1000, (int64_t)1000);
-  c.humOffsetCenti = clampValue(c.humOffsetCenti, (int64_t)-2000, (int64_t)2000);
-  if (c.relaySource == 1) {
-    c.relayThresholdCenti = clampValue(c.relayThresholdCenti, (int64_t)0, (int64_t)10000);
-  } else {
-    c.relayThresholdCenti = clampValue(c.relayThresholdCenti, (int64_t)-10000, (int64_t)20000);
-  }
-  c.relayHysteresisCenti = clampValue(c.relayHysteresisCenti, (int64_t)0, (int64_t)5000);
+  c.relayMinSwitchMs = clampValue<uint64_t>(c.relayMinSwitchMs, 0ULL, 600000ULL);
+  c.sampleIntervalMs = clampValue<uint64_t>(c.sampleIntervalMs, 1000ULL, 600000ULL);
+  c.tempOffsetCenti = clampValue<int64_t>(c.tempOffsetCenti, -1000LL, 1000LL);
+  c.humOffsetCenti = clampValue<int64_t>(c.humOffsetCenti, -2000LL, 2000LL);
+  c.relayThresholdCenti = clampValue<int64_t>(c.relayThresholdCenti, -10000LL, 20000LL);
+  c.relayHysteresisCenti = clampValue<int64_t>(c.relayHysteresisCenti, 0LL, 5000LL);
   c.reserved[0] = 0;
   c.reserved[1] = 0;
   return true;
@@ -421,11 +397,10 @@ static void triggerSensor(uint64_t now) {
   Wire.write((uint8_t)0x24);
   Wire.write((uint8_t)0x00);
   if (Wire.endTransmission() != 0) {
-    sensorState = SENSOR_IDLE;
     sensorReadFailed(now);
     return;
   }
-  sensorMeasureStartUs = nowUs();
+  sensorMeasureStartUs = now;
   sensorState = SENSOR_WAIT;
 }
 
@@ -437,68 +412,66 @@ static void updateSensor(uint64_t now) {
     return;
   }
 
-  if (sensorState != SENSOR_WAIT) {
-    sensorState = SENSOR_IDLE;
-    return;
-  }
+  if (sensorState == SENSOR_WAIT) {
+    uint64_t elapsed = now - sensorMeasureStartUs;
 
-  if (now < sensorMeasureStartUs) {
-    return;
-  }
-
-  uint64_t elapsed = now - sensorMeasureStartUs;
-  if (elapsed < SHT31_MEASUREMENT_WAIT_US) {
-    return;
-  }
-
-  bool success = false;
-
-  if (Wire.requestFrom((int)sensorAddr, 6) == 6) {
-    uint8_t b[6];
-    for (uint8_t i = 0; i < 6; ++i) {
-      b[i] = (uint8_t)Wire.read();
+    if (elapsed > SHT31_TIMEOUT_US) {
+      sensorReadFailed(now);
+      sensorState = SENSOR_IDLE;
+      return;
     }
 
-    if (sht31Crc(b, 2) == b[2] && sht31Crc(&b[3], 2) == b[5]) {
-      uint16_t traw = ((uint16_t)b[0] << 8) | b[1];
-      uint16_t hraw = ((uint16_t)b[3] << 8) | b[4];
+    if (elapsed >= SHT31_MEASUREMENT_WAIT_US) {
+      bool success = false;
 
-      int64_t t = -4500LL + (int64_t)((17500ULL * (uint64_t)traw) / 65535ULL);
-      int64_t h = (int64_t)((10000ULL * (uint64_t)hraw) / 65535ULL);
+      if (Wire.requestFrom((int)sensorAddr, 6) == 6) {
+        uint8_t b[6];
+        for (uint8_t i = 0; i < 6; ++i) {
+          b[i] = (uint8_t)Wire.read();
+        }
 
-      t += gConfig.tempOffsetCenti;
-      h += gConfig.humOffsetCenti;
+        if (sht31Crc(b, 2) == b[2] && sht31Crc(&b[3], 2) == b[5]) {
+          uint16_t traw = ((uint16_t)b[0] << 8) | b[1];
+          uint16_t hraw = ((uint16_t)b[3] << 8) | b[4];
 
-      if (h < 0) {
-        h = 0;
+          int64_t t = -4500LL + (int64_t)((17500ULL * (uint64_t)traw) / 65535ULL);
+          int64_t h = (int64_t)((10000ULL * (uint64_t)hraw) / 65535ULL);
+
+          t += gConfig.tempOffsetCenti;
+          h += gConfig.humOffsetCenti;
+
+          if (h < 0) {
+            h = 0;
+          }
+          if (h > 10000) {
+            h = 10000;
+          }
+
+          tempCenti = t;
+          humCenti = h;
+          lastSensorReadUs = now;
+          lastValidSensorUs = now;
+          sensorOk = true;
+          sensorFailCount = 0;
+          sensorReadCount++;
+          success = true;
+        }
       }
-      if (h > 10000) {
-        h = 10000;
-      }
 
-      tempCenti = t;
-      humCenti = h;
-      lastSensorReadUs = now;
-      lastValidSensorUs = now;
-      sensorOk = true;
-      sensorFailCount = 0;
-      sensorReadCount++;
-      success = true;
+      sensorState = SENSOR_IDLE;
+
+      if (success) {
+        nextSensorTriggerUs = now + (gConfig.sampleIntervalMs * 1000ULL);
+      } else {
+        sensorReadFailed(now);
+      }
     }
-  }
-
-  sensorState = SENSOR_IDLE;
-
-  if (success) {
-    nextSensorTriggerUs = now + (gConfig.sampleIntervalMs * 1000ULL);
-  } else {
-    sensorReadFailed(now);
   }
 }
 
 static void updateRelay(bool force, uint64_t now) {
   bool fresh = sensorDataFresh(now);
-  bool desired = relayOn;
+  bool desired = false;
 
   if (!gConfig.relayEnabled) {
     desired = false;
@@ -544,6 +517,7 @@ static void updateRelay(bool force, uint64_t now) {
 
   bool high = gConfig.relayActiveLow ? !relayOn : relayOn;
   uint8_t level = high ? HIGH : LOW;
+
   if (level != relayPhysical) {
     digitalWrite(PIN_RELAY, level);
     relayPhysical = level;
@@ -551,14 +525,11 @@ static void updateRelay(bool force, uint64_t now) {
 }
 
 static void applyAPSettings() {
-  dnsServer.stop();
-
   IPAddress local(192, 168, 4, 1);
   IPAddress gateway(192, 168, 4, 1);
   IPAddress subnet(255, 255, 255, 0);
 
   WiFi.persistent(false);
-  WiFi.softAPdisconnect(true);
   WiFi.mode(WIFI_AP);
   WiFi.setSleep(false);
   WiFi.softAPConfig(local, gateway, subnet);
@@ -574,21 +545,11 @@ static void applyAPSettings() {
   if (!ok) {
     ok = WiFi.softAP(DEFAULT_SSID, DEFAULT_PASS, 1, 0, MAX_AP_CLIENTS);
     if (!ok) {
-      ok = WiFi.softAP(DEFAULT_SSID, DEFAULT_PASS);
-    }
-    if (ok) {
-      Config nc = gConfig;
-      copyStr(nc.ssid, sizeof(nc.ssid), DEFAULT_SSID);
-      copyStr(nc.password, sizeof(nc.password), DEFAULT_PASS);
-      nc.channel = 1;
-      nc.hidden = 0;
-      bool changed = false;
-      if (!saveConfigIfChanged(nc, changed)) {
-        gConfig = nc;
-      }
+      WiFi.softAP(DEFAULT_SSID, DEFAULT_PASS);
     }
   }
 
+  dnsServer.stop();
   dnsServer.start(53, "*", WiFi.softAPIP());
 }
 
@@ -708,14 +669,14 @@ static bool parseDecimalCenti(const char* s, int64_t minCenti, int64_t maxCenti,
 }
 
 static bool parseBoolArg(const char* s, bool& out) {
-  if (!s || !*s) {
+  if (!s) {
     return false;
   }
   if (!strcmp(s, "1") || !strcmp(s, "true") || !strcmp(s, "on") || !strcmp(s, "yes")) {
     out = true;
     return true;
   }
-  if (!strcmp(s, "0") || !strcmp(s, "false") || !strcmp(s, "off") || !strcmp(s, "no")) {
+  if (!*s || !strcmp(s, "0") || !strcmp(s, "false") || !strcmp(s, "off") || !strcmp(s, "no")) {
     out = false;
     return true;
   }
@@ -1416,16 +1377,6 @@ static void handleSettingsSave() {
   server.send(200, "application/json", buf);
 }
 
-static bool isPrintableAscii(const String& s) {
-  for (size_t i = 0; i < s.length(); ++i) {
-    uint8_t c = (uint8_t)s.charAt(i);
-    if (c < 0x20 || c > 0x7E) {
-      return false;
-    }
-  }
-  return true;
-}
-
 static void handleWifiSave() {
   if (server.method() != HTTP_POST) {
     sendJsonError(405, "Method not allowed");
@@ -1437,18 +1388,10 @@ static void handleWifiSave() {
     sendJsonError(400, "Invalid SSID");
     return;
   }
-  if (!isPrintableAscii(ssidArg)) {
-    sendJsonError(400, "SSID must be printable ASCII");
-    return;
-  }
 
   String passArg = server.arg("password");
   if (passArg.length() > 0 && (passArg.length() < 8 || passArg.length() > 63)) {
     sendJsonError(400, "Invalid password");
-    return;
-  }
-  if (passArg.length() > 0 && !isPrintableAscii(passArg)) {
-    sendJsonError(400, "Password must be printable ASCII");
     return;
   }
 
@@ -1546,10 +1489,10 @@ void setup() {
 
   loadConfig();
 
-  pinMode(PIN_RELAY, OUTPUT);
+  digitalWrite(PIN_RELAY, gConfig.relayActiveLow ? HIGH : LOW);
   relayOn = false;
   relayPhysical = 255;
-  digitalWrite(PIN_RELAY, gConfig.relayActiveLow ? HIGH : LOW);
+  pinMode(PIN_RELAY, OUTPUT);
 
   pinMode(PIN_BOOT, INPUT_PULLUP);
 
@@ -1565,13 +1508,13 @@ void setup() {
 void loop() {
   uint64_t now = nowUs();
 
-  updateBootButton(now);
-  updateSensor(now);
-  updateRelay(false, now);
-  updatePendingActions(now);
-
   server.handleClient();
   dnsServer.processNextRequest();
+
+  updateSensor(now);
+  updateRelay(false, now);
+  updateBootButton(now);
+  updatePendingActions(now);
 
   yield();
 }

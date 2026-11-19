@@ -1,100 +1,71 @@
-## Hardware Wiring
+## 1. Hardware Wiring (NodeMCU / ESP8266)
 
-| Component | ESP8266 Pin | Notes |
+| Signal | ESP8266 Pin | NodeMCU Label |
 |---|---|---|
-| SHT31 SDA | GPIO5 (D1) | 4.7 kΩ pull-up to 3.3 V |
-| SHT31 SCL | GPIO4 (D2) | 4.7 kΩ pull-up to 3.3 V |
-| SHT31 VCC | 3.3 V | — |
-| SHT31 GND | GND | — |
-| Relay IN | GPIO12 (D6) | **Add 10 kΩ pulldown to GND** (boot strap) |
-| Relay VCC | 3.3 V or 5 V | Per module |
-| Relay GND | GND | — |
-| Boot button | GPIO0 ↔ GND | Internal pull-up enabled; **do not hold at power-on** |
+| SHT31 SDA | GPIO 5 | D1 |
+| SHT31 SCL | GPIO 4 | D2 |
+| Relay 1 (Temp/Unified) | GPIO 14 | D5 |
+| Relay 2 (Humidity) | GPIO 12 | D6 |
+| Factory reset button | GPIO 0 | D3 (FLASH key) |
+| SHT31 VCC | 3.3 V | 3V3 |
+| SHT31 GND | GND | GND |
 
-Relay module powered separately if coil > 3.3 V; use opto-isolated module for mains loads.
+> SHT31 address is auto-detected at **0x44** or **0x45**. Use 3.3 V logic only — do not feed 5 V into GPIOs.
 
----
+## 2. Flash the Firmware
 
-## Flash & First Boot
+1. Install **Arduino IDE** + **ESP8266 board package** (Boards Manager URL: `https://arduino.esp8266.com/stable/package_esp8266com_index.json`).
+2. Install libraries via Library Manager:
+   - `Adafruit SHT31 Library`
+   - `Adafruit BusIO` (dependency)
+3. Open `esp8266_sht31_controller.ino`.
+4. Select **NodeMCU 1.0 (ESP-12E Module)** and the correct COM port.
+5. Upload.
 
-1. Open the code in Arduino IDE.
-2. Install boards/libs:
-   - **ESP8266 core** (Boards Manager: `esp8266` by ESP8266 Community)
-   - **Adafruit SHT31 Library** (Library Manager)
-3. Board: **Generic ESP8266 Module** (or your exact board). Flash size ≥ 1 MB.
-4. Compile & upload. **Do not hold GPIO0 during upload power-on reset** unless your board requires it for flash mode.
-5. On first boot the device creates Wi-Fi AP:
-   - **SSID:** `ESP8266_SHT31`
-   - **Password:** `12345678`
+## 3. First Connection
 
----
+1. Power the board. It boots as a Wi-Fi access point.
+2. On your phone/PC, connect to SSID **`ESP8266_SHT31`**, password **`12345678`**.
+3. A captive portal should open automatically; if not, browse to **http://192.168.4.1**.
 
-## Connect & Use
+## 4. Configure
 
-1. On phone/PC, join `ESP8266_SHT31`.
-2. Captive portal should auto-open. If not, browse to **http://192.168.4.1**.
-3. Dashboard shows live:
-   - Temperature (°C)
-   - Humidity (%)
-   - Relay state (ON/OFF)
-   - Sensor status (OK/ERROR)
-   - Updates every 2 s
-4. Set **Temp Threshold**, **Hum Threshold**, **Hysteresis** → **Save**.
-   - Relay turns **ON** when temp ≥ temp threshold **OR** humidity ≥ hum threshold.
-   - Relay turns **OFF** when temp ≤ (threshold − hysteresis) **AND** humidity ≤ (threshold − hysteresis).
-5. **Restart** → soft reboot.
-6. **Factory Reset** → erases saved settings, reboots with defaults.
+- **Sensor & Relays tab** — set:
+  - Relay mode: *Unified* (one relay for both) or *Individual* (temp on D5, hum on D6)
+  - Temperature / humidity high & low thresholds and action mode (cool/heat, dehumidify/humidify)
+  - Relay polarity (Active Low for most 5 V relay modules)
+  - Anti-chatter interval (default 5 s)
+  - Fail-safe state on sensor loss
+  - Calibration offsets and polling rate
+- **WiFi AP Settings tab** — change SSID, password (min 8 chars), channel, visibility, max clients. Saving restarts the Wi-Fi subsystem.
+- **Diagnostics tab** — uptime, heap, error counts, relay cycles, reboot, and factory reset.
 
----
+## 5. Everyday Operation
 
-## Factory Reset via Button
+- The dashboard auto-refreshes every second.
+- Tap **°C / °F** to switch units.
+- **SHT31 Heater** button toggles the sensor's onboard heater (for condensation recovery).
+- **Reset Min/Max** clears recorded extremes.
 
-- **Hold GPIO0 button for 5 seconds** while device is running.
-- Device reboots with default thresholds (Temp 30 °C, Hum 70 %, Hysteresis 1.0).
+## 6. Factory Reset
 
----
+- **Web:** Diagnostics → *Restore Factory Defaults*.
+- **Hardware:** Hold the **FLASH (D3/GPIO0)** button for **5 seconds** — relays go off and the device reboots with defaults.
 
-## Default Settings
+## 7. Default Thresholds (out of the box)
 
-| Setting | Default |
+| Parameter | Default |
 |---|---|
-| Temp threshold | 30.0 °C |
-| Hum threshold | 70.0 % |
-| Hysteresis | 1.0 |
-| Valid temp range | -50.0 … 150.0 °C |
-| Valid hum range | 0.0 … 100.0 % |
-| Valid hysteresis | 0.0 … 50.0 |
-
-Settings persist across reboot (flash, CRC-protected, wear-minimized).
-
----
-
-## LED / Behavior Reference
-
-| Behavior | Meaning |
-|---|---|
-| Page values show `--` | First read pending (up to 2 s) |
-| Sensor status **ERROR** | SHT31 not detected — check wiring/pull-ups |
-| Relay ON, values dropping | Normal — waits for hysteresis band before turning OFF |
-| No AP visible | Check 3.3 V supply (needs ≥ 300 mA peak) |
-
----
+| Temp high / low | 28 °C / 25 °C (cooling) |
+| Humidity high / low | 70 % / 60 % (dehumidify) |
+| Relay mode | Unified, OR logic |
+| Polarity | Active Low |
+| Poll interval | 1000 ms |
+| Anti-chatter | 5 s |
+| Fail-safe | Relays OFF |
 
 ## Troubleshooting
 
-| Problem | Fix |
-|---|---|
-| AP not visible | Power cycle; verify 3.3 V regulator can supply ~500 mA peak |
-| Dashboard won't open | Manually go to `http://192.168.4.1` |
-| Sensor ERROR | Verify SDA=GPIO5, SCL=GPIO4, pull-ups present, sensor at 0x44 or 0x45 |
-| Relay stuck ON | Check threshold values; factory reset |
-| Can't flash | Disconnect relay, hold GPIO0 to GND during reset |
-| Captive portal doesn't pop up | Open browser manually to `192.168.4.1` |
-
----
-
-## Notes
-
-- AP is **always on** — device does not connect to your home Wi-Fi.
-- Only one client action at a time is needed; multiple devices can view simultaneously.
-- Settings survive power loss; unsaved changes within 2 s of a power cut may be lost (by design, to protect flash).
+- **Sensor fault badge** — check SDA/SCL wiring and 3.3 V supply; the firmware auto-recovers a hung I2C bus after 5 consecutive errors.
+- **Relay never switches** — confirm polarity matches your module (Active Low is typical), and that the anti-chatter interval hasn't blocked a recent toggle.
+- **Can't reach 192.168.4.1** — disable mobile data on the phone, or manually set a static IP in `192.168.4.0/24`.
